@@ -1,0 +1,47 @@
+
+[general]
+#pid-file=/var/run/xplhan.pid
+#interface=
+#log-file=
+#han-socket=1129
+#hanhost = localhost
+services=outside-temp, attic-temp, mains-voltage, mains-frequency
+
+
+
+[outside-temp]
+address=6
+instance = outsidetemp
+class = sensor
+type = request
+han-command = gtmp
+units = fahrenheit
+
+
+[attic-temp]
+address = 4
+instance = attictemp
+class = sensor
+type = request
+han-command = gtmp
+units = fahrenheit
+
+
+
+[mains-voltage]
+address = 3
+instance = acvolts
+han-command = gacd
+class = sensor
+type = request;
+units = volts
+
+[mains-frequency]
+address = 3
+instance = acfrequency
+han-command = gacd
+class = sensor
+type = request
+units = hertz
+
+
