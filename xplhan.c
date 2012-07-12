@@ -43,6 +43,7 @@
 #include "types.h"
 #include "notify.h"
 #include "confread.h"
+#include "socket.h"
 
 #define MALLOC_ERROR	malloc_error(__FILE__,__LINE__)
 
@@ -53,6 +54,8 @@
 #define DEF_PID_FILE		"/var/run/xplhan.pid"
 #define DEF_CONFIG_FILE		"/etc/xplhan.conf"
 #define DEF_INSTANCE_ID		"test"
+#define DEF_HOST			"localhost"
+#define DEF_PORT			1129
 
 #define MAX_SERVICES 32
 #define MAX_MESSAGES_PER_INSTANCE 5
@@ -114,6 +117,8 @@ char *progName;
 int debugLvl = 0; 
 
 static Bool noBackground = FALSE;
+static unsigned port = DEF_PORT;
+static int hanSock = -1;
 static clOverride_t clOverride = {0,0,0,0};
 
 static serviceEntryPtr_t serviceEntryHead = NULL;
@@ -126,6 +131,8 @@ static char interface[WS_SIZE] = "";
 static char logPath[WS_SIZE] = "";
 static char instanceID[WS_SIZE] = DEF_INSTANCE_ID;
 static char pidFile[WS_SIZE] = DEF_PID_FILE;
+static char host[WS_SIZE] = DEF_HOST;
+
 
 /* Commandline options. */
 
@@ -395,6 +402,7 @@ int main(int argc, char *argv[])
 	int i,j;
 	int serviceCount;
 	String p;
+	SectionEntryPtr_t se;
 	serviceEntryPtr_t sp;
 	String slist[MAX_SERVICES];
 
@@ -502,31 +510,44 @@ int main(int argc, char *argv[])
 	
 	if(!(configEntry =confreadScan(configFile, NULL)))
 		exit(1);
+	
+	/* Attempt to get general stanza */	
+	if(!(se = confreadFindSection(configEntry, "general")))
+		fatal("Error in config file: general stanza does not exist");
 
+	/* Host */
+	if((p = confreadValueBySectEntKey(se, "host")))
+		confreadStringCopy(host, p, WS_SIZE);
+		
+	/* Port */
+	if((p = confreadValueBySectEntKey(se, "port"))){
+		if(!str2uns(p, &port, 1, 65535))
+			fatal("Port must be between 1 and 65535");
+	}
 			
 	/* Instance ID */
-	if((!clOverride.instance_id) && (p = confreadValueBySectKey(configEntry, "general", "instance-id")))
+	if((!clOverride.instance_id) && (p = confreadValueBySectEntKey(se, "instance-id")))
 		confreadStringCopy(instanceID, p, sizeof(instanceID));
 		
 	/* Interface */
-	if((!clOverride.interface) && (p = confreadValueBySectKey(configEntry, "general", "interface")))
+	if((!clOverride.interface) && (p = confreadValueBySectEntKey(se, "interface")))
 		confreadStringCopy(interface, p, sizeof(interface));
 			
 	/* pid file */
-	if((!clOverride.pid_file) && (p = confreadValueBySectKey(configEntry, "general", "pid-file")))
+	if((!clOverride.pid_file) && (p = confreadValueBySectEntKey(se, "pid-file")))
 		confreadStringCopy(pidFile, p, sizeof(pidFile));	
 						
 	/* log path */
-	if((!clOverride.log_path) && (p = confreadValueBySectKey(configEntry, "general", "log-path")))
+	if((!clOverride.log_path) && (p = confreadValueBySectEntKey(se, "log-path")))
 		confreadStringCopy(logPath, p, sizeof(logPath));
 			
 	/* Build the instance list */
-	if(!(p = confreadValueBySectKey(configEntry, "general", "services")))
+	if(!(p = confreadValueBySectEntKey(se, "services")))
 		fatal("At least one service must be defined in the general section");
 	serviceCount = dupOrSplitString(p, slist, ',', MAX_SERVICES);
 	
 	for(i = 0; i < serviceCount; i++){
-		SectionEntryPtr_t se;
+	
 		if(!(se = confreadFindSection(configEntry, slist[i])))
 			fatal("Stanza for service %s does not exist", slist[i]);
 		if(!(p = confreadValueBySectEntKey(se, "instance")))
@@ -622,7 +643,14 @@ int main(int argc, char *argv[])
 		}		
 	}
 	
-	
+	/*
+	 * Do a test connect to the han server
+	 */
+	 
+	if(((hanSock = socketConnectIP("phones","1129", PF_UNSPEC, SOCK_STREAM)) < 0) || (socketPrintf(hanSock,"\n") < 0))
+		fatal("Could not connect to han server");
+	close(hanSock);
+		
 	fatal("Test exit"); /* DEBUG */
 
 	/* Turn on library debugging for level 5 */

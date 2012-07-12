@@ -414,7 +414,6 @@ const String confreadValueBySectEntKey(SectionEntryPtr_t se, const String key)
 	return confreadGetValue(confreadFindKey(se, key));
 }
 
-
 /*
 * Return key entry by section and key
 */

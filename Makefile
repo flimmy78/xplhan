@@ -18,7 +18,7 @@ DAEMONDIR = /usr/local/bin
 
 # Object file lists
 
-OBJS = $(PACKAGE).o notify.o confread.o
+OBJS = $(PACKAGE).o notify.o confread.o socket.o
 
 #Dependencies
 

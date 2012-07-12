@@ -5,7 +5,7 @@
 #log-file=
 #han-socket=1129
 #hanhost = localhost
-services=outside-temp, attic-temp, mains-voltage, mains-frequency
+services=outside-temp
 
 
 
