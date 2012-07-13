@@ -115,16 +115,53 @@ struct service_entry
 	serviceEntryPtr_t next;		
 };
 
+/*
+ * Work Queue data structure
+ * These are created by incoming xPL requests and commands
+ */
+
+
+typedef struct workq_entry workQEntry_t;
+typedef workQEntry_t * workQEntryPtr_t;
+
+
+struct workq_entry
+{
+	serviceEntryPtr_t sp;
+	String cmd;
+	workQEntryPtr_t prev;
+	workQEntryPtr_t next;
+};
+
+
+typedef struct response response_t;
+typedef response_t * responsePtr_t;
+
+struct response
+{
+	uint_least8_t address;
+	uint_least8_t command;
+	uint_least8_t params[16];
+}__attribute__ ((__packed__));
+	
+
+/*
+ * Variables
+ */
 
 char *progName;
 int debugLvl = 0; 
 
 static Bool noBackground = FALSE;
+static Bool cmdFail = FALSE;
 static int hanSock = -1;
 static clOverride_t clOverride = {0,0,0,0};
 
 static serviceEntryPtr_t serviceEntryHead = NULL;
 static serviceEntryPtr_t serviceEntryTail = NULL;
+static serviceEntryPtr_t pendingResponse = NULL;
+static workQEntryPtr_t workQHead = NULL;
+static workQEntryPtr_t workQTail = NULL;
 
 static ConfigEntryPtr_t	configEntry = NULL;
 
@@ -337,6 +374,170 @@ static void shutdownHandler(int onSignal)
 	exit(0);
 }
 
+/* 
+ * Dequeue work Queue Entry
+ */
+  
+workQEntryPtr_t dequeueWorkQueueEntry()
+{
+	workQEntryPtr_t res = NULL;
+	
+	if(workQTail){
+		res = workQTail;
+		if(workQTail->prev)
+			workQTail->prev->next = NULL;
+		else
+			workQHead = NULL;
+		workQTail = workQTail->prev;
+	}
+	return res;	
+}
+
+/* 
+ * Free a work queue entry
+ */
+
+void freeWorkQueueEntry(workQEntryPtr_t wqe)
+{
+	if(wqe){
+		if(wqe->cmd)
+			free(wqe->cmd);
+		free(wqe);
+	}
+}
+
+/* 
+ * Add a command to the work queue
+ */
+ 
+void queueCommand(String cmd, serviceEntryPtr_t sp)
+{
+
+	workQEntryPtr_t wq = NULL;
+	
+	/* Allocate work queue entry */
+	if(!(wq = mallocz(sizeof(workQEntry_t))))
+		MALLOC_ERROR;
+	debug(DEBUG_ACTION, "queueCommand()");
+	wq->cmd = cmd;
+	wq->sp = sp;
+	
+	if(!workQHead)
+		workQHead = workQTail = wq;
+	else{
+		wq->next = workQHead;
+		workQHead->prev = wq;
+		workQHead = wq;
+	}
+}
+
+/*
+ * Act on response from GTMP command
+ */
+
+void gtmpAction(unsigned char pcount, responsePtr_t resp, serviceEntryPtr_t sp)
+{
+	int val = 0;
+	char ws[12];
+	unsigned countsPerC;
+	unsigned ch;
+	int_least16_t rawTemp;
+	xPL_MessagePtr msg;
+	
+	
+	if(pcount != 5){
+		debug(DEBUG_UNEXPECTED, "gtmpAction(): Received an incorrect number of parameters, got %u, need 5", pcount);
+		return;
+	}
+	ch = resp->params[0];
+	countsPerC = (unsigned) resp->params[1];
+	rawTemp = (int_least16_t) ((((uint_least16_t) resp->params[4]) << 8) + resp->params[3]);
+	
+	printf("Raw temp = %d, counts per c = %d\n", rawTemp, countsPerC);
+	
+	/* Do conversion per units field */
+	if(sp->units == CELSIUS){
+		val = rawTemp / countsPerC;
+	}
+	else if (sp->units == FAHRENHEIT){
+		val = (9 * ((int) rawTemp))/(5 * ((int) countsPerC)) + 32;
+	}
+	else{
+		debug(DEBUG_UNEXPECTED, "gtmpAction(): Invalid unit for conversion");
+	}
+
+	
+	if(!(msg = xPL_createBroadcastMessage(sp->xplService, xPL_MESSAGE_STATUS)))
+		debug(DEBUG_UNEXPECTED, "gtmpaction(): Could not create status message");
+	xPL_setSchema(msg,"sensor","basic");
+	snprintf(ws, 10, "%d", ch);
+	xPL_setMessageNamedValue(msg, "device", ws); 
+	xPL_setMessageNamedValue(msg, "type", "temp");
+	snprintf(ws, 10, "%d", val);
+	xPL_setMessageNamedValue(msg, "current", ws);
+	xPL_setMessageNamedValue(msg, "units", (sp->units == CELSIUS) ? "celsius" : "fahrenheit");
+	xPL_sendMessage(msg);
+	xPL_releaseMessage(msg);
+
+}
+
+
+
+/*
+ * Convert 2 characters into a uint_least8_t
+ */
+uint_least8_t hex2(String s)
+{
+	uint_least8_t  res = 0;
+	int i;
+	for(i = 0; i < 2; i++){
+		res <<= 4;
+		if((s[i] >= '0') &&  (s[i] <= '9'))
+			res |= (uint_least8_t) (s[i] - '0');
+		else if((s[i] >= 'A') && (s[i] <= 'F'))
+			res |= (uint_least8_t) (s[i] - ('A' - 10));
+		else
+			break;
+	}
+	return res;	
+}
+
+
+/*
+ * Decode the response, and figure out what to do with it
+ */
+ 
+static void decodeResponse(String r)
+{
+	int i, pcount;
+	response_t response;
+	
+	debug(DEBUG_ACTION, "Line received: %s", r);
+	if(!strncmp(r, "RS", 2)){
+		response.address = hex2(r + 2);
+		response.command = hex2(r + 4);
+		pcount = (strlen(r) - 6) >> 1;
+		for(i = 0; i < pcount; i++){
+			response.params[i] = hex2(r + 6 + (i << 1));
+		}
+		debug_hexdump(DEBUG_ACTION, &response, pcount + 2, "Binary response dump: ");
+		if((pendingResponse) && (pendingResponse->address == (unsigned) response.address)){
+			switch((hanCommands_t) response.command){
+				case GTMP:
+					gtmpAction(pcount, &response, pendingResponse);
+					break;
+				
+				default:
+					debug(DEBUG_UNEXPECTED, "Unknown response received");
+					break;
+			}
+		}			
+	}
+}
+
+
+	
+
 /*
  * Handler for han socket events
  */
@@ -348,10 +549,9 @@ static void hanHandler(int fd, int revents, int userValue)
 	int res;
 	
 
-	debug(DEBUG_EXPECTED,"revents = %08X", revents);
+	debug(DEBUG_ACTION,"revents = %08X", revents);
 	
 	
-	debug(DEBUG_EXPECTED,"Foop"); // TEST
 	res = socketReadLineNonBlocking(fd, &pos, response, WS_SIZE);
 	if(res == -1)
 		debug(DEBUG_UNEXPECTED, "Socket read returned error");
@@ -361,10 +561,10 @@ static void hanHandler(int fd, int revents, int userValue)
 			xPL_removeIODevice(hanSock);
 			close(hanSock);
 			hanSock = -1;
+			cmdFail = TRUE;
 			return;
 		}
-		
-		debug(DEBUG_EXPECTED, "Line received: %s", response);
+		decodeResponse(response);
 	}
 	
 	
@@ -379,16 +579,30 @@ static void hanHandler(int fd, int revents, int userValue)
 
 static void doHanTemp(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
 {
-	char ws[32];
+	String cmd;
+	int ch;
 	const String request =  xPL_getMessageNamedValue(theMessage, "request");
+	const String channel =  xPL_getMessageNamedValue(theMessage, "device");
+
 	
-	if(!request)
+	if((!request) || (!channel))
 		return;
+		
+	ch = atoi(channel);
+		
+	debug(DEBUG_ACTION, "doHanTemp()");	
+		
+	/* Allocate buffer for command */
+	if(!(cmd = mallocz(WS_SIZE)))
+		MALLOC_ERROR;
 	
+			
 	/* Format command */
-	snprintf(ws, 32, "CA%02X%02X0000000000",sp->address, (unsigned ) sp->cmd);
-	debug(DEBUG_ACTION,"Sending HAN command: %s", ws);
-	socketPrintf(hanSock, "%s", ws);
+	snprintf(cmd, WS_SIZE, "CA%02X%02X%02X00000000",sp->address, (unsigned ) sp->cmd, ch);
+
+	queueCommand(cmd, sp);
+	
+
 }
 
 /* 
@@ -400,16 +614,8 @@ static void dispatchHanCommand(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
 	if((!theMessage) || (!sp))
 		return;
 		
-	if(hanSock == -1){ /* Socket not connected. This could have been due to an EOF detected previously */
-		if((hanSock = socketConnectIP(host, service, PF_UNSPEC, SOCK_STREAM)) < 0){
-			debug(DEBUG_UNEXPECTED, "Could not open socket to han server (post fork)");
-			return;
-		}
-		/* Add han socket to the xPL polling list */
-		if(xPL_addIODevice(hanHandler, 1234, hanSock, TRUE, FALSE, FALSE) == FALSE)
-			fatal("Could not register han socket fd with xPL");
-	}
-		
+	debug(DEBUG_ACTION, "dispatchHanCommand()");
+	
 	switch(sp->cmd){
 		case GTMP:
 			doHanTemp(theMessage, sp);
@@ -461,12 +667,38 @@ static void xPLListener(xPL_MessagePtr theMessage, xPL_ObjectPtr userValue)
 
 /*
 * Our tick handler. 
-* This is used to synchonize the sending of data to the RCS thermostat.
+* This is used check for commands to send to the HAN server.
+* If one is present, it is sent, and then dequeued and freed.
 */
 
 static void tickHandler(int userVal, xPL_ObjectPtr obj)
 {
-
+	/* debug(DEBUG_ACTION,"TICK"); */
+	if(workQTail){
+		if(hanSock == -1){ /* Socket not connected. This could have been due to an EOF detected previously */
+			if((hanSock = socketConnectIP(host, service, PF_UNSPEC, SOCK_STREAM)) < 0){
+				debug(DEBUG_UNEXPECTED, "Could not open socket to han server (post fork)");
+				freeWorkQueueEntry(dequeueWorkQueueEntry()); /* Can't process command */
+				cmdFail = TRUE;
+				/* FIXME: Need to find some way to notify the originator the command could not be completed */
+				return;
+			}
+			cmdFail = FALSE;
+			/* Add han socket to the xPL polling list */
+			if(xPL_addIODevice(hanHandler, 1234, hanSock, TRUE, FALSE, FALSE) == FALSE)
+				fatal("Could not register han socket fd with xPL");
+		}
+		debug(DEBUG_ACTION, "Sending command: %s", workQTail->cmd);
+		if(socketPrintf(hanSock, "%s", workQTail->cmd) < 0){ /* Send the command */
+			debug(DEBUG_UNEXPECTED, "Command TX failed");
+			xPL_removeIODevice(hanSock);
+			close(hanSock);
+			hanSock = -1;
+			cmdFail = TRUE;
+		}
+		pendingResponse = workQTail->sp; /* Save service entry for a potential response */
+		freeWorkQueueEntry(dequeueWorkQueueEntry()); /* Remove command from queue, and free it */
+	}
 }
 
 
