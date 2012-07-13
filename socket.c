@@ -5,6 +5,8 @@
  *
  * $Id$
  */
+ 
+
 
 #include <stdio.h>
 #include <errno.h>
@@ -75,8 +77,7 @@ int socketConnectIP(const char *host, const char *service, int family, int sockt
 		debug(DEBUG_ACTION, "socket_connect_ip(): Could not create ip socket: %s", strerror(errno));
 		return -1;
 	}
-
-
+	
 	/* Connect the socket */
 
 	if(connect(sock, (struct sockaddr *) p->ai_addr, p->ai_addrlen)) {
@@ -86,6 +87,13 @@ int socketConnectIP(const char *host, const char *service, int family, int sockt
 	}
 	
 	freeaddrinfo(list);
+	
+	/* We don't want to block reads. */
+	if(fcntl(sock, F_SETFL, O_NONBLOCK) == -1) {
+		debug(DEBUG_UNEXPECTED,"Could not set socket to nonblocking");
+		close(sock);
+		return FALSE;
+	}
 
 	/* Return this socket. */
 	return(sock);
@@ -112,25 +120,32 @@ int socketReadLineNonBlocking(int socket, unsigned *pos, char *line, int maxline
 				*pos = 0;
 				return ERROR;
 			}
-			return ERROR;
+			return FALSE;
 		}
 		else if(res == 1){
-			/* debug(DEBUG_ACTION,"Byte received"); */
+			/* debug(DEBUG_ACTION,"Byte received: %02X", c); */
 			if(c == '\r') /* Ignore return */
 				continue;
 			if(c != '\n'){
-				if(*pos < (maxline - 1))
-					line[*pos++] = c;
+				if(*pos < (maxline - 1)){
+					line[*pos] = c;
+					(*pos)++;
+				}
 				else
 					debug(DEBUG_UNEXPECTED,"End of line buffer reached!");
 
 			}
 			else{
-				debug(DEBUG_ACTION, "Line received");
+				/* debug(DEBUG_ACTION, "Line received, len = %d", *pos); */
 				line[*pos] = 0;
 				*pos = 0;
 				return TRUE;
 			}
+		}
+		else{ /* EOF */
+			*pos = 0;
+			line[0] = 0;
+			return TRUE;
 		}
 	} while(TRUE);
 
@@ -145,11 +160,34 @@ int socketReadLineNonBlocking(int socket, unsigned *pos, char *line, int maxline
 int socketPrintf(int socket, const char *format, ...){
 	va_list ap;
 	int res = 0;
+	int len;
+	char string[48];
+	char *sp = string;
     
 	va_start(ap, format);
 
-	if(socket >= 0)
-		res = vdprintf(socket, format, ap);
+	if(socket >= 0){
+		vsnprintf(string, 48, format, ap);
+		/* debug(DEBUG_ACTION, "vsnprintf = %s", string); */
+		
+		for(;;){
+			len = strlen(sp);
+			res = write(socket, sp, len);
+			if(res < 0){
+				if((errno != EAGAIN) || (errno != EWOULDBLOCK))
+					break;
+				}
+			else{
+				if(res == len){
+					res = 0;
+					break;
+				}
+				/* debug(DEBUG_EXPECTED, "retrying write"); */
+				sp += len;
+				len -= res;
+			}
+		}
+	}
 
 	va_end(ap);
 

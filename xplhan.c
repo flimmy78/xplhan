@@ -20,6 +20,8 @@
 *
 *
 */
+
+
 /* Define these if not defined */
 
 #ifndef VERSION
@@ -39,6 +41,7 @@
 #include <time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <poll.h>
 #include <xPL.h>
 #include "types.h"
 #include "notify.h"
@@ -55,7 +58,7 @@
 #define DEF_CONFIG_FILE		"/etc/xplhan.conf"
 #define DEF_INSTANCE_ID		"test"
 #define DEF_HOST			"localhost"
-#define DEF_PORT			1129
+#define DEF_SERVICE			"1129"
 
 #define MAX_SERVICES 32
 #define MAX_MESSAGES_PER_INSTANCE 5
@@ -102,7 +105,7 @@ struct service_entry
 	hanCommands_t cmd;
 	units_t units;
 	unsigned service_id;
-	uint32_t class_hash;
+	uint32_t iid_hash;
 	String instance_id;
 	String class;
 	String type;
@@ -117,7 +120,6 @@ char *progName;
 int debugLvl = 0; 
 
 static Bool noBackground = FALSE;
-static unsigned port = DEF_PORT;
 static int hanSock = -1;
 static clOverride_t clOverride = {0,0,0,0};
 
@@ -132,6 +134,7 @@ static char logPath[WS_SIZE] = "";
 static char instanceID[WS_SIZE] = DEF_INSTANCE_ID;
 static char pidFile[WS_SIZE] = DEF_PID_FILE;
 static char host[WS_SIZE] = DEF_HOST;
+static char service[WS_SIZE] = DEF_SERVICE;
 
 
 /* Commandline options. */
@@ -334,18 +337,124 @@ static void shutdownHandler(int onSignal)
 	exit(0);
 }
 
+/*
+ * Handler for han socket events
+ */
+
+static void hanHandler(int fd, int revents, int userValue)
+{
+	static unsigned pos = 0;
+	static char response[WS_SIZE];
+	int res;
+	
+
+	debug(DEBUG_EXPECTED,"revents = %08X", revents);
+	
+	
+	debug(DEBUG_EXPECTED,"Foop"); // TEST
+	res = socketReadLineNonBlocking(fd, &pos, response, WS_SIZE);
+	if(res == -1)
+		debug(DEBUG_UNEXPECTED, "Socket read returned error");
+	else if (res == 1){
+		if(!response[0]){
+			/* EOF. We must close the socket and re-open it later */
+			xPL_removeIODevice(hanSock);
+			close(hanSock);
+			hanSock = -1;
+			return;
+		}
+		
+		debug(DEBUG_EXPECTED, "Line received: %s", response);
+	}
+	
+	
+		
+}
+
+
+/*
+ * Do HAN temperature command 
+ */
+ 
+
+static void doHanTemp(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
+{
+	char ws[32];
+	const String request =  xPL_getMessageNamedValue(theMessage, "request");
+	
+	if(!request)
+		return;
+	
+	/* Format command */
+	snprintf(ws, 32, "CA%02X%02X0000000000",sp->address, (unsigned ) sp->cmd);
+	debug(DEBUG_ACTION,"Sending HAN command: %s", ws);
+	socketPrintf(hanSock, "%s", ws);
+}
+
+/* 
+ * HAN Command dispatcher
+ */
+
+static void dispatchHanCommand(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
+{
+	if((!theMessage) || (!sp))
+		return;
+		
+	if(hanSock == -1){ /* Socket not connected. This could have been due to an EOF detected previously */
+		if((hanSock = socketConnectIP(host, service, PF_UNSPEC, SOCK_STREAM)) < 0){
+			debug(DEBUG_UNEXPECTED, "Could not open socket to han server (post fork)");
+			return;
+		}
+		/* Add han socket to the xPL polling list */
+		if(xPL_addIODevice(hanHandler, 1234, hanSock, TRUE, FALSE, FALSE) == FALSE)
+			fatal("Could not register han socket fd with xPL");
+	}
+		
+	switch(sp->cmd){
+		case GTMP:
+			doHanTemp(theMessage, sp);
+			break;
+			
+		default:
+			debug(DEBUG_UNEXPECTED,"Invalid han command received: %02X", (unsigned) sp->cmd);
+			break; 
+	}
+}
+
 
 /*
 * Our Listener 
 */
 
-
-
 static void xPLListener(xPL_MessagePtr theMessage, xPL_ObjectPtr userValue)
 {
+	uint32_t iid_hash;
+	serviceEntryPtr_t sp;
 
 	
-
+	if(!xPL_isBroadcastMessage(theMessage)){ /* If not a broadcast message */
+		if(xPL_MESSAGE_COMMAND == xPL_getMessageType(theMessage)){ /* If the message is a command */
+			const String type = xPL_getSchemaType(theMessage);
+			const String class = xPL_getSchemaClass(theMessage);
+			const String instanceID = xPL_getTargetInstanceID(theMessage);
+			debug(DEBUG_ACTION, "Received message from: %s-%s.%s,\n instance id: %s, class: %s, type: %s",
+			xPL_getSourceVendor(theMessage), xPL_getSourceDeviceID(theMessage),
+			xPL_getSourceInstanceID(theMessage), instanceID, class, type);
+			
+			/* Hash the incoming instance ID */
+			iid_hash = confreadHash(instanceID);
+			
+			/* Traverse the service list looking for an instance ID which matches */
+			for(sp = serviceEntryHead; sp; sp = sp->next){
+				if((iid_hash == sp->iid_hash) && (!strcmp(instanceID, sp->instance_id)))
+					break;
+	
+			}
+			if((sp) && (!strcmp(class, sp->class)) && (!strcmp(type, sp->type)))
+				dispatchHanCommand(theMessage, sp);	
+			
+		}
+	}
 }
 
 
@@ -519,11 +628,11 @@ int main(int argc, char *argv[])
 	if((p = confreadValueBySectEntKey(se, "host")))
 		confreadStringCopy(host, p, WS_SIZE);
 		
-	/* Port */
-	if((p = confreadValueBySectEntKey(se, "port"))){
-		if(!str2uns(p, &port, 1, 65535))
-			fatal("Port must be between 1 and 65535");
-	}
+	/* Port/Service */
+	if((p = confreadValueBySectEntKey(se, "port")))
+		confreadStringCopy(service, p, WS_SIZE);
+	
+	
 			
 	/* Instance ID */
 	if((!clOverride.instance_id) && (p = confreadValueBySectEntKey(se, "instance-id")))
@@ -571,6 +680,8 @@ int main(int argc, char *argv[])
 		/* Save instance ID */	
 		if(!(sp->instance_id = strdup(p))) 
 			MALLOC_ERROR;
+		/* Hash  instance ID */
+		sp->iid_hash = confreadHash(sp->instance_id);
 			
 		/* Get Address */
 		if(!(p = confreadValueBySectEntKey(se, "address")))
@@ -583,8 +694,8 @@ int main(int argc, char *argv[])
 			fatal("class missing in stanza: %s", slist[i]);
 		if(!(sp->class = strdup(p)))
 			MALLOC_ERROR;
-		/* Hash class */
-		sp->class_hash = confreadHash(sp->class);
+	
+		
 			
 		/* Get type */
 		if(!(p = confreadValueBySectEntKey(se, "type")))
@@ -611,7 +722,9 @@ int main(int argc, char *argv[])
 		}
 		if(!(sp->units = unitsMap[j].code))
 			fatal("Unrecognized units: %s in stanza: %s", p, slist[i]);	
-			
+		
+		/* Add the service ID */
+		sp->service_id = i;	
 		
 		/* Insert entry into service list */
 		if(!serviceEntryHead)
@@ -646,12 +759,12 @@ int main(int argc, char *argv[])
 	/*
 	 * Do a test connect to the han server
 	 */
-	 
-	if(((hanSock = socketConnectIP("phones","1129", PF_UNSPEC, SOCK_STREAM)) < 0) || (socketPrintf(hanSock,"\n") < 0))
+ 
+	if((hanSock = socketConnectIP(host, service, PF_UNSPEC, SOCK_STREAM)) < 0)
 		fatal("Could not connect to han server");
 	close(hanSock);
-		
-	fatal("Test exit"); /* DEBUG */
+	hanSock = -1;
+
 
 	/* Turn on library debugging for level 5 */
 	if(debugLvl >= 5)
@@ -740,7 +853,8 @@ int main(int argc, char *argv[])
 
 	/* Create virtual services and set our application version */
 	for(sp = serviceEntryHead; sp; sp = sp->next){
-		sp->xplService = xPL_createService("hwstar", "xplhan", instanceID);
+		debug(DEBUG_EXPECTED, "Creating xplhan service with class: %s type: %s with instance ID: %s", sp->class, sp->type, sp->instance_id);
+		sp->xplService = xPL_createService("hwstar", "xplhan", sp->instance_id);
 		xPL_setServiceVersion(sp->xplService, VERSION);
 	}
 
@@ -748,8 +862,7 @@ int main(int argc, char *argv[])
   	/* Install signal traps for proper shutdown */
  	signal(SIGTERM, shutdownHandler);
  	signal(SIGINT, shutdownHandler);
-
-
+ 
 	/* Add 1 second tick service */
 	xPL_addTimeoutHandler(tickHandler, 1, NULL);
 
