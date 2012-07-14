@@ -240,10 +240,21 @@ static void malloc_error(String file, int line)
 static Bool str2uns(String s, unsigned *num, unsigned min, unsigned max)
 {
 		long val;
+		int len,i;
 		if((!num) || (!s)){
 			debug(DEBUG_UNEXPECTED, "NULL pointer passed to str2uns");
 			return FALSE;
 		}
+		
+		len = strlen(s);
+		
+		for(i = 0; i < len; i++){
+			if(!isdigit(s[i]))
+				break;
+		}
+		if(i != len)
+			return FALSE;
+			
 		val = strtol(s, NULL, 0);
 		if((val < min) || (val > max))
 			return FALSE;
@@ -580,15 +591,19 @@ static void hanHandler(int fd, int revents, int userValue)
 static void doHanTemp(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
 {
 	String cmd;
-	int ch;
+	unsigned ch;
 	const String request =  xPL_getMessageNamedValue(theMessage, "request");
-	const String channel =  xPL_getMessageNamedValue(theMessage, "device");
+	const String device =  xPL_getMessageNamedValue(theMessage, "device");
 
 	
-	if((!request) || (!channel))
+	if((!request) || (!device))
 		return;
 		
-	ch = atoi(channel);
+	if(strcmp(request, "current"))
+		return;
+		
+	if(!str2uns(device, &ch, 0, 16))
+		return;
 		
 	debug(DEBUG_ACTION, "doHanTemp()");	
 		
