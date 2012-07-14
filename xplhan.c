@@ -60,13 +60,13 @@
 #define DEF_HOST			"localhost"
 #define DEF_SERVICE			"1129"
 
-#define MAX_SERVICES 32
-#define MAX_MESSAGES_PER_INSTANCE 5
+#define MAX_SERVICES 64
 #define MAX_UNITS_PER_COMMAND 5
+#define MAX_HAN_DEVICE 16
 
 typedef enum {GNOP=0x00, GVLV= 0x10, GRLY= 0x11, GTMP=0x12, GOUT=0x13, GINP=0x14, GACD=0x15} hanCommands_t;
 
-typedef enum {NULLUNIT=0, FAHRENHEIT, CELSIUS, VOLTS, AMPS, HERTZ} units_t;
+typedef enum {NULLUNIT=0, FAHRENHEIT, CELSIUS, VOLTS, AMPS, HERTZ, OUTPUT} units_t;
  
 typedef struct cloverrides {
 	unsigned pid_file : 1;
@@ -110,7 +110,6 @@ struct service_entry
 	String instance_id;
 	String class;
 	String type;
-	xPL_MessagePtr messages[MAX_MESSAGES_PER_INSTANCE];
 	xPL_ServicePtr xplService;
 	serviceEntryPtr_t prev;
 	serviceEntryPtr_t next;		
@@ -195,7 +194,7 @@ static const struct option longOptions[] = {
 static const hanCommandMap_t hanCommandMap[] = {
 	{GTMP, {FAHRENHEIT, CELSIUS, NULLUNIT}, "gtmp"},
 	{GACD, {VOLTS, HERTZ, NULLUNIT}, "gacd"},
-	{GOUT, {NULLUNIT},"gout"},
+	{GOUT, {OUTPUT,NULLUNIT}, "gout"},
 	{GNOP, {NULLUNIT}, NULL}
 };
 
@@ -207,6 +206,7 @@ static const unitsMap_t unitsMap[] = {
 	{VOLTS,"volts"},
 	{AMPS,"amps"},
 	{HERTZ,"hertz"},
+	{OUTPUT,"output"},
 	{NULLUNIT, NULL}
 };
 
@@ -445,6 +445,60 @@ void queueCommand(String cmd, serviceEntryPtr_t sp)
 }
 
 /*
+ * Act on the response from a GOUT command
+ */
+ 
+void GOUTAction(unsigned char pcount, responsePtr_t resp, serviceEntryPtr_t sp)
+{
+	char *res, dev[12];
+	xPL_MessagePtr msg;
+
+	
+	/* Check for correct number of parameters */
+	
+	if(pcount != 3){
+		debug(DEBUG_UNEXPECTED, "GOUTAction(): Received an incorrect number of parameters, got %u, need 3", pcount);
+		return;
+	}
+
+	if(resp->params[1] != 2)
+		return; /* Only respond when status is requested */
+		
+	/* Conversion statements */
+	if(resp->params[2] == 1)
+		res = "high";
+	else if(resp->params[2] == 0)
+		res = "low";
+	else{
+		debug(DEBUG_UNEXPECTED,"Unexpected state received: %d", resp->params[2]);
+		return; 
+	}
+	
+	/* Format device as string */
+	snprintf(dev, 12, "%d", resp->params[0]);
+
+	/* Build a message */
+	
+	if(!(msg = xPL_createBroadcastMessage(sp->xplService, xPL_MESSAGE_STATUS)))
+		debug(DEBUG_UNEXPECTED, "GOUTaction(): Could not create status message");
+	xPL_setSchema(msg, "sensor", "basic");
+	xPL_setMessageNamedValue(msg, "device", dev);
+	xPL_setMessageNamedValue(msg, "type", "output");
+	xPL_setMessageNamedValue(msg, "current", res);
+	
+	
+	/* Send the message */
+	
+	xPL_sendMessage(msg);
+	
+	/* Release the resource */
+	
+	xPL_releaseMessage(msg);
+
+}
+
+
+/*
  * Act on the response from a GACD command
  */
  
@@ -600,11 +654,16 @@ static void decodeResponse(String r)
 				case GACD: /* AC voltage and frequency */
 					GACDAction(pcount, &response, pendingResponse);
 					break;
+					
+				case GOUT: /* Outputs */
+					GOUTAction(pcount, &response, pendingResponse);
+					break;
 				
 				default:
 					debug(DEBUG_UNEXPECTED, "Unknown response received");
 					break;
 			}
+			pendingResponse = NULL;
 		}			
 	}
 }
@@ -644,6 +703,99 @@ static void hanHandler(int fd, int revents, int userValue)
 	
 		
 }
+
+/* 
+ * Queue GOUT Sensor Request
+ */
+ 
+static void queueGOUTRequest(unsigned dev, unsigned subcommand, serviceEntryPtr_t sp)
+{
+	String cmd;
+	
+	/* Allocate buffer for command */
+	if(!(cmd = mallocz(WS_SIZE)))
+		MALLOC_ERROR;
+	/* Format command */
+	snprintf(cmd, WS_SIZE, "CA%02X%02X%02X%02X00",sp->address, (unsigned ) sp->cmd, dev, subcommand );
+	queueCommand(cmd, sp);
+}
+
+
+/*
+ * do HAN GOUT command
+ */
+
+static void doHanGOUT(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
+{
+	unsigned dev;
+	unsigned outputState;
+	
+	
+
+	
+	const String device = xPL_getMessageNamedValue(theMessage, "device");
+
+	
+	if(!device){
+		debug(DEBUG_UNEXPECTED,"doHanGout(): device missing, device required");
+		return;
+	}
+	
+	if(!str2uns(device, &dev, 0, MAX_HAN_DEVICE)){
+		debug(DEBUG_UNEXPECTED,"doHanGout(): bad device number: %s", device);
+		return;
+	}		
+		
+	
+	/* GOUT supports both control and sensor schemas */
+	
+	if(sp->is_sensor){ /* Sensor Request ? */
+		const String request = xPL_getMessageNamedValue(theMessage, "request");
+		if(!request){
+			debug(DEBUG_UNEXPECTED,"doHanGout(): request missing, request required");
+			return;
+		}
+			
+		if(strcmp(request, "current")){
+			debug(DEBUG_UNEXPECTED,"doHanGout(): only the current request is supported");
+			return;
+		}
+		/* Queue command */
+		queueGOUTRequest(dev, 2, sp);
+	}
+	else{ /* Else assume control request */
+		const String type = xPL_getMessageNamedValue(theMessage, "type");
+		const String current = xPL_getMessageNamedValue(theMessage, "current");
+	
+		if(!type){
+			debug(DEBUG_UNEXPECTED,"doHanGout(): type missing, type required");
+			return;
+		}
+		
+		if(!current){
+			debug(DEBUG_UNEXPECTED,"doHanGout(): current missing, current required");
+			return;
+		}			
+		
+		if(strcmp(type, "output")){
+			debug(DEBUG_UNEXPECTED,"doHanGout(): sensor type must be 'output'");
+			return;
+		}
+		if(!strcmp(current, "high"))
+			outputState = 1;
+		else if(!strcmp(current, "low"))
+			outputState = 0;
+		else{
+			debug(DEBUG_UNEXPECTED,"current must be one of: high, low");
+			return;
+		}
+		queueGOUTRequest(dev, outputState, sp);
+		
+	}
+	
+}
+
+
 
 /*
  * do HAN GACD command 
@@ -695,7 +847,7 @@ static void doHanGTMP(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
 	}
 		
 	if(device){	 /* If a device key is present, use it */
-		if(!str2uns(device, &dev, 0, 16))
+		if(!str2uns(device, &dev, 0, MAX_HAN_DEVICE))
 			return;
 	}
 	else{
@@ -742,6 +894,10 @@ static void dispatchHanCommand(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
 		
 		case GACD:
 			doHanGACD(theMessage, sp);
+			break;
+			
+		case GOUT:
+			doHanGOUT(theMessage, sp);
 			break;
 			
 		default:
@@ -819,7 +975,10 @@ static void tickHandler(int userVal, xPL_ObjectPtr obj)
 			hanSock = -1;
 			cmdFail = TRUE;
 		}
-		pendingResponse = workQTail->sp; /* Save service entry for a potential response */
+		if((workQTail->sp))
+			pendingResponse = workQTail->sp; /* Save service entry for a response */
+		else
+			pendingResponse = NULL;
 		freeWorkQueueEntry(dequeueWorkQueueEntry()); /* Remove command from queue, and free it */
 	}
 }
