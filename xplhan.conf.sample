@@ -1,11 +1,11 @@
 
 [general]
-#pid-file=/var/run/xplhan.pid
+pid-file=./xplhan.pid
 #interface=
 #log-file=
 #han-socket=1129
-#hanhost = localhost
-services=outside-temp
+#host = localhost
+services=outside-temp, attic-temp, mains-voltage, mains-frequency, attic-relay-control
 
 
 
@@ -16,6 +16,7 @@ class = sensor
 type = request
 han-command = gtmp
 units = fahrenheit
+
 
 
 [attic-temp]
@@ -43,5 +44,13 @@ han-command = gacd
 class = sensor
 type = request
 units = hertz
+
+[attic-relay-control]
+address = 4
+instance = atticrelaycontrol
+class = control
+type = basic
+han-command = gout
+
 
 
