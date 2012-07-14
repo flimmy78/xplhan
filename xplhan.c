@@ -444,10 +444,67 @@ void queueCommand(String cmd, serviceEntryPtr_t sp)
 }
 
 /*
+ * Act on the response from a GACD command
+ */
+ 
+void GACDAction(unsigned char pcount, responsePtr_t resp, serviceEntryPtr_t sp)
+{
+	char ws[12];
+	uint_least16_t voltsX10, freqX100;
+	xPL_MessagePtr msg;
+	float volts, freq;
+	
+	/* Check for correct number of parameters */
+	
+	if(pcount != 4){
+		debug(DEBUG_UNEXPECTED, "GACDAction(): Received an incorrect number of parameters, got %u, need 4", pcount);
+		return;
+	}
+	/* Conversion statements */
+	
+	voltsX10 = (((uint_least16_t) resp->params[1]) << 8) + resp->params[0];
+	freqX100 = (((uint_least16_t) resp->params[3]) << 8) + resp->params[2];
+	volts = ((float) voltsX10)/10;
+	freq = ((float) freqX100)/100;
+	
+	debug(DEBUG_ACTION, "AC Volts = %3.1f, AC Frequency = %2.2f", volts, freq);
+	
+	/* Build a message */
+	
+	if(!(msg = xPL_createBroadcastMessage(sp->xplService, xPL_MESSAGE_STATUS)))
+		debug(DEBUG_UNEXPECTED, "gtmpaction(): Could not create status message");
+	xPL_setSchema(msg, "sensor", "basic");
+	if(sp->units == VOLTS){ /* Voltage or frequency? */
+		xPL_setMessageNamedValue(msg, "type", "volts");
+		snprintf(ws, 10, "%3.1f", volts);
+		xPL_setMessageNamedValue(msg, "current", ws);
+		xPL_setMessageNamedValue(msg, "units", "volts");
+	}
+	else{
+		xPL_setMessageNamedValue(msg, "type", "frequency");
+		snprintf(ws, 10, "%2.2f", freq);
+		xPL_setMessageNamedValue(msg, "current", ws);
+		xPL_setMessageNamedValue(msg, "units", "hertz");
+	}
+	
+	/* Send the message */
+	
+	xPL_sendMessage(msg);
+	
+	/* Release the resource */
+	
+	xPL_releaseMessage(msg);
+
+}
+
+
+
+
+/*
  * Act on response from GTMP command
  */
 
-void gtmpAction(unsigned char pcount, responsePtr_t resp, serviceEntryPtr_t sp)
+void GTMPAction(unsigned char pcount, responsePtr_t resp, serviceEntryPtr_t sp)
 {
 	int val = 0;
 	char ws[12];
@@ -458,7 +515,7 @@ void gtmpAction(unsigned char pcount, responsePtr_t resp, serviceEntryPtr_t sp)
 	
 	
 	if(pcount != 5){
-		debug(DEBUG_UNEXPECTED, "gtmpAction(): Received an incorrect number of parameters, got %u, need 5", pcount);
+		debug(DEBUG_UNEXPECTED, "GTMPAction(): Received an incorrect number of parameters, got %u, need 5", pcount);
 		return;
 	}
 	ch = resp->params[0];
@@ -475,12 +532,12 @@ void gtmpAction(unsigned char pcount, responsePtr_t resp, serviceEntryPtr_t sp)
 		val = (9 * ((int) rawTemp))/(5 * ((int) countsPerC)) + 32;
 	}
 	else{
-		debug(DEBUG_UNEXPECTED, "gtmpAction(): Invalid unit for conversion");
+		debug(DEBUG_UNEXPECTED, "GTMPAction(): Invalid unit for conversion");
 	}
 
 	
 	if(!(msg = xPL_createBroadcastMessage(sp->xplService, xPL_MESSAGE_STATUS)))
-		debug(DEBUG_UNEXPECTED, "gtmpaction(): Could not create status message");
+		debug(DEBUG_UNEXPECTED, "GTMPaction(): Could not create status message");
 	xPL_setSchema(msg,"sensor","basic");
 	snprintf(ws, 10, "%d", ch);
 	xPL_setMessageNamedValue(msg, "device", ws); 
@@ -535,8 +592,12 @@ static void decodeResponse(String r)
 		debug_hexdump(DEBUG_ACTION, &response, pcount + 2, "Binary response dump: ");
 		if((pendingResponse) && (pendingResponse->address == (unsigned) response.address)){
 			switch((hanCommands_t) response.command){
-				case GTMP:
-					gtmpAction(pcount, &response, pendingResponse);
+				case GTMP: /* Temperature */
+					GTMPAction(pcount, &response, pendingResponse);
+					break;
+					
+				case GACD: /* AC voltage and frequency */
+					GACDAction(pcount, &response, pendingResponse);
 					break;
 				
 				default:
@@ -583,13 +644,40 @@ static void hanHandler(int fd, int revents, int userValue)
 		
 }
 
+/*
+ * do HAN GACD command 
+ */
+ 
+static void doHanGACD(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
+{
+	String cmd;
+	const String request =  xPL_getMessageNamedValue(theMessage, "request");
+	
+	if(!request)
+		return;
+	if(strcmp(request, "current")) /* Only the current command is supported  */
+		return;
+	
+	debug(DEBUG_ACTION, "doHanGACD()");	
+		
+	/* Allocate buffer for command */
+	if(!(cmd = mallocz(WS_SIZE)))
+		MALLOC_ERROR;
+	
+			
+	/* Format command */
+	snprintf(cmd, WS_SIZE, "CA%02X%02X00000000",sp->address, (unsigned ) sp->cmd);
+
+	queueCommand(cmd, sp);
+		
+}
 
 /*
  * Do HAN temperature command 
  */
  
 
-static void doHanTemp(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
+static void doHanGTMP(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
 {
 	String cmd;
 	unsigned dev;
@@ -611,7 +699,7 @@ static void doHanTemp(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
 		return;
 
 		
-	debug(DEBUG_ACTION, "doHanTemp()");	
+	debug(DEBUG_ACTION, "doHanGTMP()");	
 		
 	/* Allocate buffer for command */
 	if(!(cmd = mallocz(WS_SIZE)))
@@ -639,7 +727,11 @@ static void dispatchHanCommand(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
 	
 	switch(sp->cmd){
 		case GTMP:
-			doHanTemp(theMessage, sp);
+			doHanGTMP(theMessage, sp);
+			break;
+		
+		case GACD:
+			doHanGACD(theMessage, sp);
 			break;
 			
 		default:
