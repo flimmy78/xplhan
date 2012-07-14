@@ -64,7 +64,7 @@
 #define MAX_MESSAGES_PER_INSTANCE 5
 #define MAX_UNITS_PER_COMMAND 5
 
-typedef enum {GNOP=0x00, GTMP=0x12, GACD=0x15} hanCommands_t;
+typedef enum {GNOP=0x00, GVLV= 0x10, GRLY= 0x11, GTMP=0x12, GOUT=0x13, GINP=0x14, GACD=0x15} hanCommands_t;
 
 typedef enum {NULLUNIT=0, FAHRENHEIT, CELSIUS, VOLTS, AMPS, HERTZ} units_t;
  
@@ -105,8 +105,8 @@ struct service_entry
 	hanCommands_t cmd;
 	units_t units;
 	unsigned service_id;
-	unsigned default_device;
 	uint32_t iid_hash;
+	Bool is_sensor;
 	String instance_id;
 	String class;
 	String type;
@@ -195,6 +195,7 @@ static const struct option longOptions[] = {
 static const hanCommandMap_t hanCommandMap[] = {
 	{GTMP, {FAHRENHEIT, CELSIUS, NULLUNIT}, "gtmp"},
 	{GACD, {VOLTS, HERTZ, NULLUNIT}, "gacd"},
+	{GOUT, {NULLUNIT},"gout"},
 	{GNOP, {NULLUNIT}, NULL}
 };
 
@@ -653,11 +654,14 @@ static void doHanGACD(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
 	String cmd;
 	const String request =  xPL_getMessageNamedValue(theMessage, "request");
 	
-	if(!request)
+	if(!request){
+		debug(DEBUG_UNEXPECTED, "doHanGACD(): no request specified");
 		return;
-	if(strcmp(request, "current")) /* Only the current command is supported  */
+	}
+	if(strcmp(request, "current")){ /* Only the current command is supported  */
+		debug(DEBUG_UNEXPECTED, "doHanGACD(): only the current request is supported");
 		return;
-	
+	}
 	debug(DEBUG_ACTION, "doHanGACD()");	
 		
 	/* Allocate buffer for command */
@@ -685,18 +689,24 @@ static void doHanGTMP(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
 	const String device =  xPL_getMessageNamedValue(theMessage, "device");
 
 	
-	if(!request)
+	if(!request){
+		debug(DEBUG_UNEXPECTED, "doHanGTMP(): no request specified");
 		return;
+	}
 		
 	if(device){	 /* If a device key is present, use it */
 		if(!str2uns(device, &dev, 0, 16))
 			return;
 	}
-	else /* Else use the default device */
-		dev = sp->default_device;
-	
-	if(strcmp(request, "current")) /* Only the current command is supported  */
+	else{
+		debug(DEBUG_UNEXPECTED, "doHanGTMP(): no device specified, device is required");
 		return;
+	}
+	
+	if(strcmp(request, "current")){ 
+		debug(DEBUG_UNEXPECTED, "doHanGTMP(): only the 'current' request is supported");
+		return;
+	}
 
 		
 	debug(DEBUG_ACTION, "doHanGTMP()");	
@@ -1039,6 +1049,8 @@ int main(int argc, char *argv[])
 			fatal("class missing in stanza: %s", slist[i]);
 		if(!(sp->class = strdup(p)))
 			MALLOC_ERROR;
+		if(!strcmp(sp->class, "sensor")) /* Set flag if sensor */
+			sp->is_sensor = TRUE;
 	
 		
 			
@@ -1058,22 +1070,18 @@ int main(int argc, char *argv[])
 		if(!(sp->cmd = hanCommandMap[j].code))
 			fatal("Unrecognized han-command: %s in stanza: %s", p, slist[i]);
 			
-		/* Map units */
-		if(!(p = confreadValueBySectEntKey(se, "units")))
-			fatal("units missing in stanza: %s", slist[i]);		
-		for(j = 0; unitsMap[j].code ; j++){
-			if(!strcmp(p, unitsMap[j].keyword))
-				break;
+		/* Map units, if class is 'sensor' */
+		if(sp->is_sensor){
+			if(!(p = confreadValueBySectEntKey(se, "units")))
+				fatal("units missing in stanza: %s", slist[i]);			
+			for(j = 0; unitsMap[j].code ; j++){
+				if(!strcmp(p, unitsMap[j].keyword))
+					break;
+			}
 		}
 		if(!(sp->units = unitsMap[j].code))
 			fatal("Unrecognized units: %s in stanza: %s", p, slist[i]);	
-		
-		/* Check for optional default-device */
-		if((p = confreadValueBySectEntKey(se, "default-device"))){
-			if(!str2uns(p, &sp->default_device, 0, 16))
-				fatal("default-device is not a number or out of range");
-		}
-			
+				
 		
 		/* Add the service ID */
 		sp->service_id = i;	
@@ -1090,19 +1098,21 @@ int main(int argc, char *argv[])
 	free(slist[0]); /* Free service list */
 	
 	/*
-	 * Sanity check the command to units mapping 
+	 * Sanity check the command to units mapping if class is 'sensor'
 	 */
 	 
 	 for(sp = serviceEntryHead; sp; sp = sp->next){
-		 for(i = 0; hanCommandMap[i].code; i++){
-			if(hanCommandMap[i].code == sp->cmd){
-				for(j = 0; hanCommandMap[i].valid_units[j]; j++){
-					if(sp->units == hanCommandMap[i].valid_units[j]){
-						break;
+		 if(sp->is_sensor){
+			for(i = 0; hanCommandMap[i].code; i++){
+				if(hanCommandMap[i].code == sp->cmd){
+					for(j = 0; hanCommandMap[i].valid_units[j]; j++){
+						if(sp->units == hanCommandMap[i].valid_units[j]){
+							break;
+						}
 					}
-				}
-				if(!hanCommandMap[i].valid_units[j]){
-					fatal("Instance %s fails sanity check of han command to units", sp->instance_id);
+					if(!hanCommandMap[i].valid_units[j]){
+						fatal("Instance %s fails sanity check of han command to units", sp->instance_id);
+					}
 				}
 			}
 		}		
