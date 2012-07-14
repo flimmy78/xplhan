@@ -105,6 +105,7 @@ struct service_entry
 	hanCommands_t cmd;
 	units_t units;
 	unsigned service_id;
+	unsigned default_device;
 	uint32_t iid_hash;
 	String instance_id;
 	String class;
@@ -591,19 +592,24 @@ static void hanHandler(int fd, int revents, int userValue)
 static void doHanTemp(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
 {
 	String cmd;
-	unsigned ch;
+	unsigned dev;
 	const String request =  xPL_getMessageNamedValue(theMessage, "request");
 	const String device =  xPL_getMessageNamedValue(theMessage, "device");
 
 	
-	if((!request) || (!device))
+	if(!request)
 		return;
 		
-	if(strcmp(request, "current"))
+	if(device){	 /* If a device key is present, use it */
+		if(!str2uns(device, &dev, 0, 16))
+			return;
+	}
+	else /* Else use the default device */
+		dev = sp->default_device;
+	
+	if(strcmp(request, "current")) /* Only the current command is supported  */
 		return;
-		
-	if(!str2uns(device, &ch, 0, 16))
-		return;
+
 		
 	debug(DEBUG_ACTION, "doHanTemp()");	
 		
@@ -613,7 +619,7 @@ static void doHanTemp(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
 	
 			
 	/* Format command */
-	snprintf(cmd, WS_SIZE, "CA%02X%02X%02X00000000",sp->address, (unsigned ) sp->cmd, ch);
+	snprintf(cmd, WS_SIZE, "CA%02X%02X%02X00000000",sp->address, (unsigned ) sp->cmd, dev);
 
 	queueCommand(cmd, sp);
 	
@@ -969,6 +975,13 @@ int main(int argc, char *argv[])
 		}
 		if(!(sp->units = unitsMap[j].code))
 			fatal("Unrecognized units: %s in stanza: %s", p, slist[i]);	
+		
+		/* Check for optional default-device */
+		if((p = confreadValueBySectEntKey(se, "default-device"))){
+			if(!str2uns(p, &sp->default_device, 0, 16))
+				fatal("default-device is not a number or out of range");
+		}
+			
 		
 		/* Add the service ID */
 		sp->service_id = i;	
