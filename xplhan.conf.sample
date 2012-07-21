@@ -5,7 +5,8 @@ pid-file=./xplhan.pid
 #log-file=
 #han-socket=1129
 #host = localhost
-services=outside-temp, attic-temp, mains-voltage, mains-frequency, attic-relay-control
+host = phones
+services=outside-temp, attic-temp, mains-voltage, mains-frequency, attic-relay-control, attic-relay-request
 
 
 
@@ -16,6 +17,9 @@ class = sensor
 type = request
 han-command = gtmp
 units = fahrenheit
+polling-interval = 60
+channel = 1
+
 
 
 
@@ -26,7 +30,8 @@ class = sensor
 type = request
 han-command = gtmp
 units = fahrenheit
-
+polling-interval = 60
+channel = 0
 
 
 [mains-voltage]
@@ -51,6 +56,16 @@ instance = atticrelaycontrol
 class = control
 type = basic
 han-command = gout
+channel = 0
 
+
+[attic-relay-request]
+address = 4
+instance = atticrelayrequest
+class = sensor
+type = request
+han-command = gout
+units = output
+channel = 0
 
 

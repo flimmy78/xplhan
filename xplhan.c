@@ -61,8 +61,10 @@
 #define DEF_SERVICE			"1129"
 
 #define MAX_SERVICES 64
+#define MAX_CHANNEL 16
 #define MAX_UNITS_PER_COMMAND 5
 #define MAX_HAN_DEVICE 16
+#define MAX_POLL_INTERVAL 604800
 
 typedef enum {GNOP=0x00, GVLV= 0x10, GRLY= 0x11, GTMP=0x12, GOUT=0x13, GINP=0x14, GACD=0x15} hanCommands_t;
 
@@ -101,12 +103,17 @@ typedef serviceEntry_t * serviceEntryPtr_t;
  
 struct service_entry
 {
-	unsigned address;
-	hanCommands_t cmd;
-	units_t units;
-	unsigned service_id;
-	uint32_t iid_hash;
 	Bool is_sensor;
+	int poll_last;
+	unsigned address;
+	unsigned polling_interval;
+	unsigned poll_counter;
+	unsigned service_id;
+	unsigned channel;
+	units_t units;
+	uint32_t iid_hash;
+	hanCommands_t cmd;
+	float poll_f_last;
 	String instance_id;
 	String class;
 	String type;
@@ -127,6 +134,7 @@ typedef workQEntry_t * workQEntryPtr_t;
 
 struct workq_entry
 {
+	Bool is_poll;
 	serviceEntryPtr_t sp;
 	String cmd;
 	workQEntryPtr_t prev;
@@ -159,7 +167,7 @@ static clOverride_t clOverride = {0,0,0,0};
 
 static serviceEntryPtr_t serviceEntryHead = NULL;
 static serviceEntryPtr_t serviceEntryTail = NULL;
-static serviceEntryPtr_t pendingResponse = NULL;
+static workQEntryPtr_t pendingResponse = NULL;
 static workQEntryPtr_t workQHead = NULL;
 static workQEntryPtr_t workQTail = NULL;
 
@@ -423,7 +431,7 @@ void freeWorkQueueEntry(workQEntryPtr_t wqe)
  * Add a command to the work queue
  */
  
-void queueCommand(String cmd, serviceEntryPtr_t sp)
+void queueCommand(String cmd, serviceEntryPtr_t sp, Bool isPoll)
 {
 
 	workQEntryPtr_t wq = NULL;
@@ -433,6 +441,7 @@ void queueCommand(String cmd, serviceEntryPtr_t sp)
 		MALLOC_ERROR;
 	debug(DEBUG_ACTION, "queueCommand()");
 	wq->cmd = cmd;
+	wq->is_poll = isPoll;
 	wq->sp = sp;
 	
 	if(!workQHead)
@@ -448,11 +457,19 @@ void queueCommand(String cmd, serviceEntryPtr_t sp)
  * Act on the response from a GOUT command
  */
  
-void GOUTAction(unsigned char pcount, responsePtr_t resp, serviceEntryPtr_t sp)
+void GOUTAction(unsigned char pcount, responsePtr_t resp, workQEntryPtr_t wq)
 {
+	int msgType = xPL_MESSAGE_STATUS;
 	char *res, dev[12];
-	xPL_MessagePtr msg;
+	xPL_MessagePtr msg = NULL;
+	serviceEntryPtr_t sp = NULL;
+	
 
+
+	if((!resp) ||(!wq) || (!wq->sp))
+		return;
+		
+	sp = wq->sp;
 	
 	/* Check for correct number of parameters */
 	
@@ -479,7 +496,16 @@ void GOUTAction(unsigned char pcount, responsePtr_t resp, serviceEntryPtr_t sp)
 
 	/* Build a message */
 	
-	if(!(msg = xPL_createBroadcastMessage(sp->xplService, xPL_MESSAGE_STATUS)))
+	if(wq->is_poll){ /* Was this the result of a poll */
+		if(resp->params[2] == sp->poll_last) /* Was there a change ? */
+			return;
+		debug(DEBUG_EXPECTED, "Sending trigger");
+		sp->poll_last = resp->params[2];
+		msgType = xPL_MESSAGE_TRIGGER;
+	}
+	
+	
+	if(!(msg = xPL_createBroadcastMessage(sp->xplService, msgType)))
 		debug(DEBUG_UNEXPECTED, "GOUTaction(): Could not create status message");
 	xPL_setSchema(msg, "sensor", "basic");
 	xPL_setMessageNamedValue(msg, "device", dev);
@@ -502,12 +528,20 @@ void GOUTAction(unsigned char pcount, responsePtr_t resp, serviceEntryPtr_t sp)
  * Act on the response from a GACD command
  */
  
-void GACDAction(unsigned char pcount, responsePtr_t resp, serviceEntryPtr_t sp)
+void GACDAction(unsigned char pcount, responsePtr_t resp, workQEntryPtr_t wq)
 {
 	char ws[12];
+	int msgType = xPL_MESSAGE_STATUS;
 	uint_least16_t voltsX10, freqX100;
-	xPL_MessagePtr msg;
+	xPL_MessagePtr msg = NULL;
 	float volts, freq;
+	serviceEntryPtr_t sp = NULL;
+
+	if((!resp) ||(!wq) || (!wq->sp))
+		return;
+		
+	sp = wq->sp;
+	
 	
 	/* Check for correct number of parameters */
 	
@@ -526,7 +560,18 @@ void GACDAction(unsigned char pcount, responsePtr_t resp, serviceEntryPtr_t sp)
 	
 	/* Build a message */
 	
-	if(!(msg = xPL_createBroadcastMessage(sp->xplService, xPL_MESSAGE_STATUS)))
+	
+	if(wq->is_poll){ /* Was this the result of a poll */
+		float thisMeas = (sp->units == VOLTS) ? volts : freq;
+		if(sp->poll_f_last == thisMeas) /* Was there a change ? */
+			return;
+		debug(DEBUG_EXPECTED, "Sending trigger");
+		sp->poll_f_last = thisMeas;
+		msgType = xPL_MESSAGE_TRIGGER;
+	}
+
+	
+	if(!(msg = xPL_createBroadcastMessage(sp->xplService, msgType)))
 		debug(DEBUG_UNEXPECTED, "gtmpaction(): Could not create status message");
 	xPL_setSchema(msg, "sensor", "basic");
 	if(sp->units == VOLTS){ /* Voltage or frequency? */
@@ -559,21 +604,25 @@ void GACDAction(unsigned char pcount, responsePtr_t resp, serviceEntryPtr_t sp)
  * Act on response from GTMP command
  */
 
-void GTMPAction(unsigned char pcount, responsePtr_t resp, serviceEntryPtr_t sp)
+void GTMPAction(unsigned char pcount, responsePtr_t resp, workQEntryPtr_t wq)
 {
 	int val = 0;
+	int msgType = xPL_MESSAGE_STATUS;
 	char ws[12];
 	unsigned countsPerC;
-	unsigned ch;
 	int_least16_t rawTemp;
-	xPL_MessagePtr msg;
+	xPL_MessagePtr msg = NULL;
+	serviceEntryPtr_t sp = NULL;
 	
+	if((!resp) ||(!wq) || (!wq->sp))
+		return;
+		
+	sp = wq->sp;
 	
 	if(pcount != 5){
 		debug(DEBUG_UNEXPECTED, "GTMPAction(): Received an incorrect number of parameters, got %u, need 5", pcount);
 		return;
 	}
-	ch = resp->params[0];
 	countsPerC = (unsigned) resp->params[1];
 	rawTemp = (int_least16_t) ((((uint_least16_t) resp->params[4]) << 8) + resp->params[3]);
 	
@@ -590,12 +639,22 @@ void GTMPAction(unsigned char pcount, responsePtr_t resp, serviceEntryPtr_t sp)
 		debug(DEBUG_UNEXPECTED, "GTMPAction(): Invalid unit for conversion");
 	}
 
+
 	
-	if(!(msg = xPL_createBroadcastMessage(sp->xplService, xPL_MESSAGE_STATUS)))
-		debug(DEBUG_UNEXPECTED, "GTMPaction(): Could not create status message");
+	if(wq->is_poll){ /* Was this the result of a poll */
+		if(val == sp->poll_last) /* Was there a change ? */
+			return;
+		debug(DEBUG_EXPECTED, "Sending trigger");
+		sp->poll_last = val;
+		msgType = xPL_MESSAGE_TRIGGER;
+	}
+	
+
+	
+	if(!(msg = xPL_createBroadcastMessage(sp->xplService, msgType)))
+		debug(DEBUG_UNEXPECTED, "GTMPaction(): Could not create message");
 	xPL_setSchema(msg,"sensor","basic");
-	snprintf(ws, 10, "%d", ch);
-	xPL_setMessageNamedValue(msg, "device", ws); 
+	xPL_setMessageNamedValue(msg, "device", "0"); 
 	xPL_setMessageNamedValue(msg, "type", "temp");
 	snprintf(ws, 10, "%d", val);
 	xPL_setMessageNamedValue(msg, "current", ws);
@@ -645,7 +704,8 @@ static void decodeResponse(String r)
 			response.params[i] = hex2(r + 6 + (i << 1));
 		}
 		debug_hexdump(DEBUG_ACTION, &response, pcount + 2, "Binary response dump: ");
-		if((pendingResponse) && (pendingResponse->address == (unsigned) response.address)){
+		if((pendingResponse) && (pendingResponse->sp) && 
+		(pendingResponse->sp->address == (unsigned) response.address)){
 			switch((hanCommands_t) response.command){
 				case GTMP: /* Temperature */
 					GTMPAction(pcount, &response, pendingResponse);
@@ -663,8 +723,11 @@ static void decodeResponse(String r)
 					debug(DEBUG_UNEXPECTED, "Unknown response received");
 					break;
 			}
+		}
+		if(pendingResponse){ /* Free the work queue entry if it exists */
+			freeWorkQueueEntry(pendingResponse);
 			pendingResponse = NULL;
-		}			
+		}
 	}
 }
 
@@ -708,7 +771,7 @@ static void hanHandler(int fd, int revents, int userValue)
  * Queue GOUT Sensor Request
  */
  
-static void queueGOUTRequest(unsigned dev, unsigned subcommand, serviceEntryPtr_t sp)
+static void qHanGOUT(unsigned subcommand, serviceEntryPtr_t sp, Bool isPoll)
 {
 	String cmd;
 	
@@ -716,8 +779,8 @@ static void queueGOUTRequest(unsigned dev, unsigned subcommand, serviceEntryPtr_
 	if(!(cmd = mallocz(WS_SIZE)))
 		MALLOC_ERROR;
 	/* Format command */
-	snprintf(cmd, WS_SIZE, "CA%02X%02X%02X%02X00",sp->address, (unsigned ) sp->cmd, dev, subcommand );
-	queueCommand(cmd, sp);
+	snprintf(cmd, WS_SIZE, "CA%02X%02X%02X%02X00",sp->address, (unsigned ) sp->cmd, sp->channel, subcommand );
+	queueCommand(cmd, sp, isPoll);
 }
 
 
@@ -761,7 +824,7 @@ static void doHanGOUT(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
 			return;
 		}
 		/* Queue command */
-		queueGOUTRequest(dev, 2, sp);
+		qHanGOUT(2, sp, FALSE);
 	}
 	else{ /* Else assume control request */
 		const String type = xPL_getMessageNamedValue(theMessage, "type");
@@ -789,9 +852,28 @@ static void doHanGOUT(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
 			debug(DEBUG_UNEXPECTED,"current must be one of: high, low");
 			return;
 		}
-		queueGOUTRequest(dev, outputState, sp);
+		qHanGOUT(outputState, sp, FALSE);
 		
 	}
+	
+}
+
+/*
+ * Queue han GACD command
+ */
+ 
+static void qHanGACD(serviceEntryPtr_t sp, Bool isPoll)
+{
+	String cmd;
+	
+	/* Allocate buffer for command */
+	if(!(cmd = mallocz(WS_SIZE)))
+		MALLOC_ERROR;
+			
+	/* Format command */
+	snprintf(cmd, WS_SIZE, "CA%02X%02X00000000",sp->address, (unsigned ) sp->cmd);
+
+	queueCommand(cmd, sp, isPoll);
 	
 }
 
@@ -803,7 +885,7 @@ static void doHanGOUT(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
  
 static void doHanGACD(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
 {
-	String cmd;
+
 	const String request =  xPL_getMessageNamedValue(theMessage, "request");
 	
 	if(!request){
@@ -815,6 +897,22 @@ static void doHanGACD(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
 		return;
 	}
 	debug(DEBUG_ACTION, "doHanGACD()");	
+	
+	
+	qHanGACD(sp, FALSE);
+	
+}
+
+/*
+ * Queue a HAN GTMP command
+ */
+
+static void qHanGTMP(serviceEntryPtr_t sp, Bool isPoll)
+{
+	String cmd;
+	
+	if(!sp)
+		return;
 		
 	/* Allocate buffer for command */
 	if(!(cmd = mallocz(WS_SIZE)))
@@ -822,21 +920,20 @@ static void doHanGACD(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
 	
 			
 	/* Format command */
-	snprintf(cmd, WS_SIZE, "CA%02X%02X00000000",sp->address, (unsigned ) sp->cmd);
+	snprintf(cmd, WS_SIZE, "CA%02X%02X%02X00000000",sp->address, (unsigned ) sp->cmd, sp->channel);
 
-	queueCommand(cmd, sp);
-		
+	queueCommand(cmd, sp, isPoll);
 }
+
 
 /*
  * Do HAN temperature command 
  */
  
 
+
 static void doHanGTMP(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
 {
-	String cmd;
-	unsigned dev;
 	const String request =  xPL_getMessageNamedValue(theMessage, "request");
 	const String device =  xPL_getMessageNamedValue(theMessage, "device");
 
@@ -846,13 +943,16 @@ static void doHanGTMP(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
 		return;
 	}
 		
-	if(device){	 /* If a device key is present, use it */
-		if(!str2uns(device, &dev, 0, MAX_HAN_DEVICE))
-			return;
+	if(!device){
+		debug(DEBUG_UNEXPECTED, "doHanGTMP(): no device specified, device is required");
+
 	}
 	else{
-		debug(DEBUG_UNEXPECTED, "doHanGTMP(): no device specified, device is required");
-		return;
+		unsigned dev;
+		if(!str2uns(device, &dev, 0, 0)){
+			debug(DEBUG_UNEXPECTED, "doHanGTMP(): device=0 is required");
+			return;
+		}
 	}
 	
 	if(strcmp(request, "current")){ 
@@ -862,19 +962,38 @@ static void doHanGTMP(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
 
 		
 	debug(DEBUG_ACTION, "doHanGTMP()");	
-		
-	/* Allocate buffer for command */
-	if(!(cmd = mallocz(WS_SIZE)))
-		MALLOC_ERROR;
-	
-			
-	/* Format command */
-	snprintf(cmd, WS_SIZE, "CA%02X%02X%02X00000000",sp->address, (unsigned ) sp->cmd, dev);
 
-	queueCommand(cmd, sp);
-	
-
+	qHanGTMP(sp, FALSE);
 }
+
+/*
+ * Poll dispatcher
+ */ 
+
+static void dispatchPollCommand(serviceEntryPtr_t sp)
+{
+	if(!sp)
+		return;
+	switch(sp->cmd){
+		case GTMP:
+			qHanGTMP(sp, TRUE);
+			break;
+			
+		case GACD:
+			qHanGACD(sp, TRUE);
+			break;
+			
+		case GOUT:
+			qHanGOUT(2, sp, TRUE);
+			break;
+		
+		default:
+			debug(DEBUG_UNEXPECTED, "Got unrecognized poll request %u", (unsigned) sp->cmd);
+			break;
+	}	
+}
+
+
 
 /* 
  * HAN Command dispatcher
@@ -952,7 +1071,25 @@ static void xPLListener(xPL_MessagePtr theMessage, xPL_ObjectPtr userValue)
 
 static void tickHandler(int userVal, xPL_ObjectPtr obj)
 {
+	serviceEntryPtr_t se;
+	
 	/* debug(DEBUG_ACTION,"TICK"); */
+	
+	/* Traverse the service list looking for expired poll counters */
+	
+	for(se = serviceEntryHead; se; se = se->next){
+		if(se->polling_interval){
+			if(!se->poll_counter){
+				se->poll_counter = se->polling_interval;
+				dispatchPollCommand(se);
+			}
+			else
+				se->poll_counter--;
+		}
+	}
+			
+
+	
 	if(workQTail){
 		if(hanSock == -1){ /* Socket not connected. This could have been due to an EOF detected previously */
 			if((hanSock = socketConnectIP(host, service, PF_UNSPEC, SOCK_STREAM)) < 0){
@@ -975,11 +1112,8 @@ static void tickHandler(int userVal, xPL_ObjectPtr obj)
 			hanSock = -1;
 			cmdFail = TRUE;
 		}
-		if((workQTail->sp))
-			pendingResponse = workQTail->sp; /* Save service entry for a response */
-		else
-			pendingResponse = NULL;
-		freeWorkQueueEntry(dequeueWorkQueueEntry()); /* Remove command from queue, and free it */
+		pendingResponse = workQTail;
+		dequeueWorkQueueEntry(); /* Remove command from queue */
 	}
 }
 
@@ -1240,8 +1374,24 @@ int main(int argc, char *argv[])
 		}
 		if(!(sp->units = unitsMap[j].code))
 			fatal("Unrecognized units: %s in stanza: %s", p, slist[i]);	
-				
+			
+		/* Check poll-interval if present and class is sensor */
 		
+		if((p = confreadValueBySectEntKey(se, "polling-interval"))){
+			if(!sp->is_sensor)
+				fatal("In stanza %s, a polling-interval is specified for non-sensor service", slist[i]);
+			if(!str2uns(p, &sp->polling_interval, 0,  MAX_POLL_INTERVAL))
+				fatal("In stanza %s, polling-interval must be between 0 and %u", slist[i], MAX_POLL_INTERVAL);
+		}
+		
+		
+		/* Check channel if present */
+		
+		if((p = confreadValueBySectEntKey(se, "channel"))){
+			if(!str2uns(p, &sp->channel, 0,  MAX_POLL_INTERVAL))
+				fatal("In stanza %s, channel must be between 0 and %u", slist[i], MAX_CHANNEL);
+		}
+			
 		/* Add the service ID */
 		sp->service_id = i;	
 		
