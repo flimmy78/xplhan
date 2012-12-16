@@ -34,6 +34,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <signal.h>
 #include <ctype.h>
 #include <getopt.h>
@@ -66,7 +67,7 @@
 #define MAX_HAN_DEVICE 16
 #define MAX_POLL_INTERVAL 604800
 
-typedef enum {GNOP=0x00, GVLV= 0x10, GRLY= 0x11, GTMP=0x12, GOUT=0x13, GINP=0x14, GACD=0x15} hanCommands_t;
+typedef enum {GNOP=0x00, GVLV= 0x10, GRLY= 0x11, GTMP=0x12, GOUT=0x13, GINP=0x14, GACD=0x15, GVLT=0x16, GCUR=0x17} hanCommands_t;
 
 typedef enum {NULLUNIT=0, FAHRENHEIT, CELSIUS, VOLTS, AMPS, HERTZ, OUTPUT} units_t;
  
@@ -203,6 +204,7 @@ static const hanCommandMap_t hanCommandMap[] = {
 	{GTMP, {FAHRENHEIT, CELSIUS, NULLUNIT}, "gtmp"},
 	{GACD, {VOLTS, HERTZ, NULLUNIT}, "gacd"},
 	{GOUT, {OUTPUT,NULLUNIT}, "gout"},
+	{GVLT, {VOLTS,NULLUNIT}, "gvlt"},
 	{GNOP, {NULLUNIT}, NULL}
 };
 
@@ -664,6 +666,88 @@ void GTMPAction(unsigned char pcount, responsePtr_t resp, workQEntryPtr_t wq)
 
 }
 
+/*
+ * Act on the response from a GVLT command
+ */
+ 
+
+void GVLTAction(unsigned char pcount, responsePtr_t resp, workQEntryPtr_t wq)
+{
+	int msgType = xPL_MESSAGE_STATUS;
+	xPL_MessagePtr msg = NULL;
+	serviceEntryPtr_t sp = NULL;
+	uint32_t voltres;
+	int8_t voltexp;
+	uint16_t rawvolts;
+	float voltage;
+	char ws[12];
+	
+	if((!resp) ||(!wq) || (!wq->sp))
+		return;
+		
+	sp = wq->sp;
+	
+	if(pcount != 8){
+		debug(DEBUG_UNEXPECTED, "GVLTAction(): Received an incorrect number of parameters, got %u, need 8", pcount);
+		return;
+	}
+	
+	/* Extract values */
+	
+	voltres = ((uint32_t) resp->params[4]) + 
+			  (((uint32_t) resp->params[5]) * 256 ) +
+			  (((uint32_t) resp->params[6]) * 65536) +
+			  (((uint32_t) resp->params[7]) * 16777216);
+
+			  
+	voltexp = (int8_t) resp->params[1];
+	rawvolts = (uint16_t) ((((uint16_t) resp->params[3]) * 256) + resp->params[2]);
+	
+	debug(DEBUG_ACTION, "GVLTAction(): voltres = %u", voltres);
+	debug(DEBUG_ACTION, "GVLTAction(): voltexp = %d", voltexp);
+	debug(DEBUG_ACTION, "GVLTAction(): rawvolts = %u", rawvolts);
+	
+	/* Scale result */
+
+	voltage = ((float) rawvolts) * ((float)voltres)*powf(10.0,voltexp);
+	debug(DEBUG_ACTION, "GVLTAction(): Voltage = %3.3f", voltage);
+
+
+	/* Test for change */
+	
+	if(wq->is_poll){ /* Was this the result of a poll */
+		if(voltage == sp->poll_f_last) /* Was there a change ? */
+			return;
+		debug(DEBUG_EXPECTED, "Sending trigger");
+		sp->poll_f_last = voltage;
+		msgType = xPL_MESSAGE_TRIGGER;
+	}
+	
+    /* Send message */
+    
+	if(!(msg = xPL_createBroadcastMessage(sp->xplService, msgType))){
+		debug(DEBUG_UNEXPECTED, "GVLTaction(): Could not create message");
+		return;
+	}
+	xPL_setSchema(msg,"sensor","basic");
+	xPL_setMessageNamedValue(msg, "device", "0"); 
+	xPL_setMessageNamedValue(msg, "type", "volts");
+	snprintf(ws, 10, "%3.3f", voltage);
+	xPL_setMessageNamedValue(msg, "current", ws);
+	xPL_setMessageNamedValue(msg, "units", "volts");
+	xPL_sendMessage(msg);
+	xPL_releaseMessage(msg);
+}
+
+/*
+ * Act on the response from a GCUR command
+ */
+ 
+
+void GCURAction(unsigned char pcount, responsePtr_t resp, workQEntryPtr_t wq)
+{
+}
+
 
 
 /*
@@ -717,6 +801,14 @@ static void decodeResponse(String r)
 					
 				case GOUT: /* Outputs */
 					GOUTAction(pcount, &response, pendingResponse);
+					break;
+					
+				case GVLT: /* Get voltage */
+					GVLTAction(pcount, &response, pendingResponse);
+					break;
+					
+				case GCUR: /* Get current */
+					GCURAction(pcount, &response, pendingResponse);
 					break;
 				
 				default:
@@ -967,6 +1059,68 @@ static void doHanGTMP(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
 }
 
 /*
+ * Queue han GVLT command
+ */
+ 
+static void qHanGVLT(serviceEntryPtr_t sp, Bool isPoll)
+{
+	String cmd;
+	
+	/* Allocate buffer for command */
+	if(!(cmd = mallocz(WS_SIZE)))
+		MALLOC_ERROR;
+			
+	/* Format command */
+	snprintf(cmd, WS_SIZE, "CA%02X%02X0000000000000000",sp->address, (unsigned ) sp->cmd);
+
+	queueCommand(cmd, sp, isPoll);
+	
+}
+
+
+
+/*
+ * do HAN GVLT command 
+ */
+ 
+static void doHanGVLT(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
+{
+
+	const String request =  xPL_getMessageNamedValue(theMessage, "request");
+	const String device =  xPL_getMessageNamedValue(theMessage, "device");
+	
+	if(!request){
+		debug(DEBUG_UNEXPECTED, "doHanGVLT(): no request specified");
+		return;
+	}
+	if(!device){
+		debug(DEBUG_UNEXPECTED, "doHanGVLT(): no device specified, device is required");
+
+	}
+	else{
+		unsigned dev;
+		if(!str2uns(device, &dev, 0, 0)){
+			debug(DEBUG_UNEXPECTED, "doHanGVLT(): device=0 is required");
+			return;
+		}
+	}
+	
+	if(strcmp(request, "current")){ /* Only the current command is supported  */
+		debug(DEBUG_UNEXPECTED, "doHanGVLT(): only the current request is supported");
+		return;
+	}
+	debug(DEBUG_ACTION, "doHanGVLT()");	
+	
+	
+	qHanGVLT(sp, FALSE);
+	
+}
+
+
+
+
+
+/*
  * Poll dispatcher
  */ 
 
@@ -985,6 +1139,10 @@ static void dispatchPollCommand(serviceEntryPtr_t sp)
 			
 		case GOUT:
 			qHanGOUT(2, sp, TRUE);
+			break;
+			
+		case GVLT:
+			qHanGVLT(sp, TRUE);
 			break;
 		
 		default:
@@ -1017,6 +1175,10 @@ static void dispatchHanCommand(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
 			
 		case GOUT:
 			doHanGOUT(theMessage, sp);
+			break;
+			
+		case GVLT:
+			doHanGVLT(theMessage, sp);
 			break;
 			
 		default:

@@ -6,7 +6,7 @@ pid-file=./xplhan.pid
 #han-socket=1129
 #host = localhost
 host = phones
-services=outside-temp, attic-temp, mains-voltage, mains-frequency, attic-relay-control, attic-relay-request
+services=outside-temp, attic-temp, mains-voltage, mains-frequency, attic-relay-control, attic-relay-request,battery-voltage
 
 
 
@@ -39,8 +39,19 @@ address = 3
 instance = acvolts
 han-command = gacd
 class = sensor
-type = request;
+type = request
 units = volts
+
+[battery-voltage]
+address = 7
+instance = batteryvolts
+han-command = gvlt
+class = sensor
+type = request
+units = volts
+polling-interval = 30
+channel = 0
+
 
 [mains-frequency]
 address = 3
