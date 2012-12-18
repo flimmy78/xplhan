@@ -67,7 +67,8 @@
 #define MAX_HAN_DEVICE 16
 #define MAX_POLL_INTERVAL 604800
 
-typedef enum {GNOP=0x00, GVLV= 0x10, GRLY= 0x11, GTMP=0x12, GOUT=0x13, GINP=0x14, GACD=0x15, GVLT=0x16, GCUR=0x17} hanCommands_t;
+typedef enum {GNOP=0x00, GVLV= 0x10, GRLY= 0x11, GTMP=0x12, GOUT=0x13, GINP=0x14, GACD=0x15, GVLT=0x16, 
+               GCUR=0x17} hanCommands_t;
 
 typedef enum {NULLUNIT=0, FAHRENHEIT, CELSIUS, VOLTS, AMPS, HERTZ, OUTPUT} units_t;
  
@@ -205,6 +206,7 @@ static const hanCommandMap_t hanCommandMap[] = {
 	{GACD, {VOLTS, HERTZ, NULLUNIT}, "gacd"},
 	{GOUT, {OUTPUT,NULLUNIT}, "gout"},
 	{GVLT, {VOLTS,NULLUNIT}, "gvlt"},
+	{GCUR, {AMPS,NULLUNIT}, "gcur"},
 	{GNOP, {NULLUNIT}, NULL}
 };
 
@@ -746,6 +748,84 @@ void GVLTAction(unsigned char pcount, responsePtr_t resp, workQEntryPtr_t wq)
 
 void GCURAction(unsigned char pcount, responsePtr_t resp, workQEntryPtr_t wq)
 {
+	int msgType = xPL_MESSAGE_STATUS;
+	xPL_MessagePtr msg = NULL;
+	serviceEntryPtr_t sp = NULL;
+	uint32_t ampsres;
+	int8_t ampsexp;
+	int16_t rawamps;
+	float amps;
+	char ws[12];
+	union {
+		int16_t amps16;
+		uint8_t amps8[2];
+	}sconv;
+	
+	if((!resp) ||(!wq) || (!wq->sp))
+		return;
+		
+	sp = wq->sp;
+	
+	if(pcount != 8){
+		debug(DEBUG_UNEXPECTED, "GCURAction(): Received an incorrect number of parameters, got %u, need 8", pcount);
+		return;
+	}
+	
+	/* Extract values */
+	
+	ampsres = ((uint32_t) resp->params[4]) + 
+			  (((uint32_t) resp->params[5]) * 256 ) +
+			  (((uint32_t) resp->params[6]) * 65536) +
+			  (((uint32_t) resp->params[7]) * 16777216);
+
+			  
+	ampsexp = (int8_t) resp->params[1];
+	
+	#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+		sconv.amps8[0] = resp->params[2];
+		sconv.amps8[1] = resp->params[3];
+	#else
+		sconv.amps8[1] = resp->params[2];
+		sconv.amps8[0] = resp->params[3];
+	#endif	
+	
+	rawamps = sconv.amps16;
+	
+	
+	debug(DEBUG_ACTION, "GCURAction(): ampsres = %u", ampsres);
+	debug(DEBUG_ACTION, "GCURAction(): ampsexp = %d", ampsexp);
+	debug(DEBUG_ACTION, "GCURAction(): rawamps = %d", rawamps);
+	
+	/* Scale result */
+
+	amps = ((float) rawamps) * ((float)ampsres)*powf(10.0,ampsexp);
+	debug(DEBUG_ACTION, "GCURAction(): Amps = %3.3f", amps);
+
+
+	/* Test for change */
+	
+	if(wq->is_poll){ /* Was this the result of a poll */
+		if(amps == sp->poll_f_last) /* Was there a change ? */
+			return;
+		debug(DEBUG_EXPECTED, "Sending trigger");
+		sp->poll_f_last = amps;
+		msgType = xPL_MESSAGE_TRIGGER;
+	}
+	
+    /* Send message */
+    
+	if(!(msg = xPL_createBroadcastMessage(sp->xplService, msgType))){
+		debug(DEBUG_UNEXPECTED, "GCURaction(): Could not create message");
+		return;
+	}
+	xPL_setSchema(msg,"sensor","basic");
+	xPL_setMessageNamedValue(msg, "device", "0"); 
+	xPL_setMessageNamedValue(msg, "type", "amps");
+	snprintf(ws, 10, "%3.3f", amps);
+	xPL_setMessageNamedValue(msg, "current", ws);
+	xPL_setMessageNamedValue(msg, "units", "amps");
+	xPL_sendMessage(msg);
+	xPL_releaseMessage(msg);
 }
 
 
@@ -1116,9 +1196,63 @@ static void doHanGVLT(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
 	
 }
 
+/*
+ * Queue han GCUR command
+ */
+ 
+static void qHanGCUR(serviceEntryPtr_t sp, Bool isPoll)
+{
+	String cmd;
+	
+	/* Allocate buffer for command */
+	if(!(cmd = mallocz(WS_SIZE)))
+		MALLOC_ERROR;
+			
+	/* Format command */
+	snprintf(cmd, WS_SIZE, "CA%02X%02X0000000000000000",sp->address, (unsigned ) sp->cmd);
+
+	queueCommand(cmd, sp, isPoll);
+	
+}
 
 
 
+/*
+ * do HAN GCUR command 
+ */
+ 
+static void doHanGCUR(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
+{
+
+	const String request =  xPL_getMessageNamedValue(theMessage, "request");
+	const String device =  xPL_getMessageNamedValue(theMessage, "device");
+	
+	if(!request){
+		debug(DEBUG_UNEXPECTED, "doHanGCUR(): no request specified");
+		return;
+	}
+	if(!device){
+		debug(DEBUG_UNEXPECTED, "doHanGCUR(): no device specified, device is required");
+
+	}
+	else{
+		unsigned dev;
+		if(!str2uns(device, &dev, 0, 0)){
+			debug(DEBUG_UNEXPECTED, "doHanGCUR(): device=0 is required");
+			return;
+		}
+	}
+	
+	if(strcmp(request, "current")){ /* Only the current command is supported  */
+		debug(DEBUG_UNEXPECTED, "doHanGCUR(): only the current request is supported");
+		return;
+	}
+	debug(DEBUG_ACTION, "doHanGCUR()");	
+	
+	
+	qHanGCUR(sp, FALSE);
+	
+}
 
 /*
  * Poll dispatcher
@@ -1143,6 +1277,10 @@ static void dispatchPollCommand(serviceEntryPtr_t sp)
 			
 		case GVLT:
 			qHanGVLT(sp, TRUE);
+			break;
+		
+		case GCUR:
+			qHanGCUR(sp, TRUE);
 			break;
 		
 		default:
@@ -1179,6 +1317,10 @@ static void dispatchHanCommand(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
 			
 		case GVLT:
 			doHanGVLT(theMessage, sp);
+			break;
+			
+		case GCUR:
+			doHanGCUR(theMessage, sp);
 			break;
 			
 		default:
