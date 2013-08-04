@@ -68,9 +68,9 @@
 #define MAX_POLL_INTERVAL 604800
 
 typedef enum {GNOP=0x00, GVLV= 0x10, GRLY= 0x11, GTMP=0x12, GOUT=0x13, GINP=0x14, GACD=0x15, GVLT=0x16, 
-               GCUR=0x17} hanCommands_t;
+               GCUR=0x17,GHUM= 0x30, GWSP= 0x31, GWDR = 0x32, GRGC = 0x33} hanCommands_t;
 
-typedef enum {NULLUNIT=0, FAHRENHEIT, CELSIUS, VOLTS, AMPS, HERTZ, OUTPUT} units_t;
+typedef enum {NULLUNIT=0, FAHRENHEIT, CELSIUS, VOLTS, AMPS, HERTZ, OUTPUT, PERCENTRH, MPH, KMH, _WDIRMAP, IN, MM} units_t;
  
 typedef struct cloverrides {
 	unsigned pid_file : 1;
@@ -113,6 +113,7 @@ struct service_entry
 	unsigned service_id;
 	unsigned channel;
 	units_t units;
+	char *units_keyword;
 	uint32_t iid_hash;
 	hanCommands_t cmd;
 	float poll_f_last;
@@ -207,6 +208,10 @@ static const hanCommandMap_t hanCommandMap[] = {
 	{GOUT, {OUTPUT,NULLUNIT}, "gout"},
 	{GVLT, {VOLTS,NULLUNIT}, "gvlt"},
 	{GCUR, {AMPS,NULLUNIT}, "gcur"},
+	{GHUM, {PERCENTRH,NULLUNIT},"ghum"},
+	{GWSP, {MPH,KMH,NULLUNIT},"gwsp"},
+	{GWDR, {_WDIRMAP,NULLUNIT},"gwdr"},
+	{GRGC, {IN,MM,NULLUNIT},"grgc"},
 	{GNOP, {NULLUNIT}, NULL}
 };
 
@@ -219,21 +224,40 @@ static const unitsMap_t unitsMap[] = {
 	{AMPS,"amps"},
 	{HERTZ,"hertz"},
 	{OUTPUT,"output"},
+	{PERCENTRH,"%rh"},
+	{MPH,"mph"},
+	{KMH,"kmh"},
+	{_WDIRMAP,"wdirmap"},
+	{IN,"in."},
+	{MM,"mm."},
 	{NULLUNIT, NULL}
 };
 
+static char *dirmap[16] = {
+	"ese",
+	"ene",
+	"e",
+	"sse",
+	"se",
+	"ssw",
+	"s",
+	"nne",
+	"ne",
+	"wsw",
+	"sw",
+	"nnw",
+	"n",
+	"wnw",
+	"nw",
+	"w" };
 	
-
-
 /* 
  * Allocate a memory block and zero it out
  */
 
 static void *mallocz(size_t size)
 {
-	void *m = malloc(size);
-	if(m)
-		memset(m, 0, size);
+	void *m = calloc(size, sizeof(uint8_t));
 	return m;
 }
  
@@ -828,6 +852,285 @@ void GCURAction(unsigned char pcount, responsePtr_t resp, workQEntryPtr_t wq)
 	xPL_releaseMessage(msg);
 }
 
+/*
+ * Act on response from GHUM command
+ */
+
+void GHUMAction(unsigned char pcount, responsePtr_t resp, workQEntryPtr_t wq)
+{
+	float val = 0;
+	int msgType = xPL_MESSAGE_STATUS;
+	char ws[12];
+	unsigned countsPerRHP;
+	int_least16_t rawHum;
+	xPL_MessagePtr msg = NULL;
+	serviceEntryPtr_t sp = NULL;
+	
+	if((!resp) ||(!wq) || (!wq->sp))
+		return;
+		
+	sp = wq->sp;
+	
+	if(pcount != 6){
+		debug(DEBUG_UNEXPECTED, "GHUMAction(): Received an incorrect number of parameters, got %u, need 6", pcount);
+		return;
+	}
+	countsPerRHP = (unsigned) resp->params[1];
+	rawHum = (int_least16_t) ((((uint_least16_t) resp->params[4]) << 8) + resp->params[3]);
+	
+	if(resp->params[5])
+		debug(DEBUG_UNEXPECTED, "GHUMAction():  Sensor error: code = %d", resp->params[5]);
+	else
+		debug(DEBUG_EXPECTED, "Raw humidity = %d, counts per c = %d\n", rawHum, countsPerRHP);
+	
+	/* Do conversion per units field */
+
+	if (sp->units == PERCENTRH){
+		val = ((float) rawHum)/((int) countsPerRHP);
+	}
+	else{
+		debug(DEBUG_UNEXPECTED, "GHUMAction(): Invalid unit for conversion");
+	}
+
+
+	
+	if(wq->is_poll){ /* Was this the result of a poll */
+		if(val == sp->poll_f_last) /* Was there a change ? */
+			return;
+		debug(DEBUG_EXPECTED, "Sending trigger");
+		sp->poll_f_last = val;
+		msgType = xPL_MESSAGE_TRIGGER;
+	}
+	
+
+	
+	if(!(msg = xPL_createBroadcastMessage(sp->xplService, msgType)))
+		debug(DEBUG_UNEXPECTED, "GHUMaction(): Could not create message");
+	xPL_setSchema(msg,"sensor","basic");
+	xPL_setMessageNamedValue(msg, "device", "0"); 
+	xPL_setMessageNamedValue(msg, "type", "humidity");
+	snprintf(ws, 10, "%2.1f", val);
+	xPL_setMessageNamedValue(msg, "current", ws);
+	xPL_setMessageNamedValue(msg, "units", "%rh");
+	xPL_sendMessage(msg);
+	xPL_releaseMessage(msg);
+
+}
+
+/*
+ * Act on response from GWSP command
+ */
+
+void GWSPAction(unsigned char pcount, responsePtr_t resp, workQEntryPtr_t wq)
+{
+	float val;
+	int msgType = xPL_MESSAGE_STATUS;
+	char ws[12];
+	uint_least32_t counts;
+	uint_least16_t mantissa;
+	int_least8_t exponent;
+	xPL_MessagePtr msg = NULL;
+	serviceEntryPtr_t sp = NULL;
+	
+	if((!resp) ||(!wq) || (!wq->sp))
+		return;
+		
+	sp = wq->sp;
+	
+	if(pcount != 6){
+		debug(DEBUG_UNEXPECTED, "GWSPAction(): Received an incorrect number of parameters, got %u, need 6", pcount);
+		return;
+	}
+	exponent = (int_least8_t) resp->params[1];
+	mantissa =  ((((uint_least16_t) resp->params[3]) << 8) + resp->params[2]);
+	counts =  ((((uint_least32_t) resp->params[5]) << 8) + resp->params[4]);
+	
+	printf("Raw counts  = %u", counts);
+	
+	/* Calculate result */
+	val =  ((float)mantissa)*powf(10.0,exponent) / (float) counts;
+	debug(DEBUG_ACTION, "GWSPAction(): Windspeed = %3.1f kmh", val);
+	
+	
+	
+	/* Do conversion per units field */
+
+	if (sp->units == KMH);
+	else if(sp->units == MPH)
+		val *= 0.621371;
+	else{
+		debug(DEBUG_UNEXPECTED, "GWSPAction(): Invalid unit for conversion");
+	}
+
+
+	
+	if(wq->is_poll){ /* Was this the result of a poll */
+		if(val == sp->poll_f_last) /* Was there a change ? */
+			return;
+		debug(DEBUG_EXPECTED, "Sending trigger");
+		sp->poll_f_last = val;
+		msgType = xPL_MESSAGE_TRIGGER;
+	}
+	
+
+	
+	if(!(msg = xPL_createBroadcastMessage(sp->xplService, msgType)))
+		debug(DEBUG_UNEXPECTED, "GWSPaction(): Could not create message");
+	xPL_setSchema(msg,"sensor","basic");
+	xPL_setMessageNamedValue(msg, "device", "0"); 
+	xPL_setMessageNamedValue(msg, "type", "windspeed");
+	snprintf(ws, 10, "%3.1f", val);
+	xPL_setMessageNamedValue(msg, "current", ws);
+	xPL_setMessageNamedValue(msg, "units", (sp->units == KMH)? "kmh":"mph");
+	xPL_sendMessage(msg);
+	xPL_releaseMessage(msg);
+
+}
+
+
+/*
+ * Act on response from GWDR command
+ */
+
+void GWDRAction(unsigned char pcount, responsePtr_t resp, workQEntryPtr_t wq)
+{
+	int msgType = xPL_MESSAGE_STATUS;
+	char *wd;
+	unsigned char dircode;
+	xPL_MessagePtr msg = NULL;
+	serviceEntryPtr_t sp = NULL;
+
+	
+	if((!resp) ||(!wq) || (!wq->sp))
+		return;
+		
+	sp = wq->sp;
+	
+	if(pcount != 3){
+		debug(DEBUG_UNEXPECTED, "GWDRAction(): Received an incorrect number of parameters, got %u, need 3", pcount);
+		return;
+	}
+	dircode = resp->params[0];
+	
+	
+	debug(DEBUG_ACTION, "GWDRAction(): Wind direction code = %u", dircode);
+	
+	
+	/* Do conversion per units field */
+
+	if(sp->units == _WDIRMAP){
+
+		if(dircode < 16){
+			wd = dirmap[dircode];
+		}
+	    else if(dircode == 0xfe)
+			wd = "short";
+		else if (dircode == 0xff)
+			wd = "open";
+		else
+			wd = "error";
+	}	
+	else{
+		wd = "badunits";
+		debug(DEBUG_UNEXPECTED, "GWDRction(): Invalid unit for conversion");
+	}
+	
+	debug(DEBUG_EXPECTED, "wd = %s", wd);
+	
+	if(wq->is_poll){ /* Was this the result of a poll */
+		if(dircode == sp->poll_last) /* Was there a change ? */
+			return;
+		debug(DEBUG_EXPECTED, "Sending trigger");
+		sp->poll_last = dircode;
+		msgType = xPL_MESSAGE_TRIGGER;
+	}
+	
+
+	
+	if(!(msg = xPL_createBroadcastMessage(sp->xplService, msgType)))
+		debug(DEBUG_UNEXPECTED, "GWDRaction(): Could not create message");
+	xPL_setSchema(msg,"sensor","basic");
+	xPL_setMessageNamedValue(msg, "device", "0"); 
+	xPL_setMessageNamedValue(msg, "type", "winddir");
+	xPL_setMessageNamedValue(msg, "current", wd);
+	xPL_sendMessage(msg);
+	xPL_releaseMessage(msg);
+
+}
+
+/*
+ * Act on response from GRGC command
+ */
+
+void GRGCAction(unsigned char pcount, responsePtr_t resp, workQEntryPtr_t wq)
+{
+	float val;
+	int msgType = xPL_MESSAGE_STATUS;
+	char ws[12];
+	uint_least32_t counts;
+	uint_least16_t mantissa;
+	int_least8_t exponent;
+	xPL_MessagePtr msg = NULL;
+	serviceEntryPtr_t sp = NULL;
+	
+	if((!resp) ||(!wq) || (!wq->sp))
+		return;
+		
+	sp = wq->sp;
+	
+	if(pcount != 9){
+		debug(DEBUG_UNEXPECTED, "GRGCAction(): Received an incorrect number of parameters, got %u, need 9", pcount);
+		return;
+	}
+	exponent = (int_least8_t) resp->params[1];
+	mantissa =  ((((uint_least16_t) resp->params[3]) << 8) + resp->params[2]);
+	counts = ((uint32_t) resp->params[5]) + 
+			  (((uint32_t) resp->params[6]) * 256 ) +
+			  (((uint32_t) resp->params[7]) * 65536) +
+			  (((uint32_t) resp->params[8]) * 16777216);
+
+	printf("Raw counts  = %u", counts);
+	
+	/* Calculate result */
+	val =  ((float)mantissa)*powf(10.0,exponent) * (float) counts;
+	debug(DEBUG_ACTION, "GRGCAction(): Raingauge = %6.3f mm", val);
+	
+	
+	
+	/* Do conversion per units field */
+
+	if (sp->units == MM);
+	else if(sp->units == IN)
+		val /= 25.4;
+	else{
+		debug(DEBUG_UNEXPECTED, "GRGCAction(): Invalid unit for conversion");
+	}
+
+
+	
+	if(wq->is_poll){ /* Was this the result of a poll */
+		if(val == sp->poll_f_last) /* Was there a change ? */
+			return;
+		debug(DEBUG_EXPECTED, "Sending trigger");
+		sp->poll_f_last = val;
+		msgType = xPL_MESSAGE_TRIGGER;
+	}
+	
+
+	
+	if(!(msg = xPL_createBroadcastMessage(sp->xplService, msgType)))
+		debug(DEBUG_UNEXPECTED, "GRGCaction(): Could not create message");
+	xPL_setSchema(msg,"sensor","basic");
+	xPL_setMessageNamedValue(msg, "device", "0"); 
+	xPL_setMessageNamedValue(msg, "type", "raingauge");
+	snprintf(ws, 10, "%6.3f", val);
+	xPL_setMessageNamedValue(msg, "current", ws);
+	xPL_setMessageNamedValue(msg, "units", (sp->units == KMH)? "mm.":"in.");
+	xPL_sendMessage(msg);
+	xPL_releaseMessage(msg);
+
+}
+
 
 
 /*
@@ -890,7 +1193,23 @@ static void decodeResponse(String r)
 				case GCUR: /* Get current */
 					GCURAction(pcount, &response, pendingResponse);
 					break;
-				
+					
+			    case GHUM: /* Get Humidity */
+					GHUMAction(pcount, &response, pendingResponse);
+					break;
+					
+				case GWSP: /* Get wind speed */
+					GWSPAction(pcount, &response, pendingResponse);
+					break;
+					
+				case GWDR: /* Get wind direction */
+					GWDRAction(pcount, &response, pendingResponse);
+					break;
+					
+				case GRGC: /* Get rain gauge */
+					GRGCAction(pcount, &response, pendingResponse);
+					break;
+					
 				default:
 					debug(DEBUG_UNEXPECTED, "Unknown response received");
 					break;
@@ -902,8 +1221,6 @@ static void decodeResponse(String r)
 		}
 	}
 }
-
-
 	
 
 /*
@@ -1255,6 +1572,261 @@ static void doHanGCUR(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
 }
 
 /*
+ * Queue a HAN GHUM command
+ */
+
+static void qHanGHUM(serviceEntryPtr_t sp, Bool isPoll)
+{
+	String cmd;
+	
+	if(!sp)
+		return;
+		
+	/* Allocate buffer for command */
+	if(!(cmd = mallocz(WS_SIZE)))
+		MALLOC_ERROR;
+	
+			
+	/* Format command */
+	snprintf(cmd, WS_SIZE, "CA%02X%02X%02X0000000000",sp->address, (unsigned ) sp->cmd, sp->channel);
+
+	queueCommand(cmd, sp, isPoll);
+}
+
+
+/*
+ * Do HAN humidity command 
+ */
+ 
+
+
+static void doHanGHUM(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
+{
+	const String request =  xPL_getMessageNamedValue(theMessage, "request");
+	const String device =  xPL_getMessageNamedValue(theMessage, "device");
+
+	
+	if(!request){
+		debug(DEBUG_UNEXPECTED, "doHanGHUM(): no request specified");
+		return;
+	}
+		
+	if(!device){
+		debug(DEBUG_UNEXPECTED, "doHanGHUM(): no device specified, device is required");
+
+	}
+	else{
+		unsigned dev;
+		if(!str2uns(device, &dev, 0, 0)){
+			debug(DEBUG_UNEXPECTED, "doHanGHUM(): device=0 is required");
+			return;
+		}
+	}
+	
+	if(strcmp(request, "current")){ 
+		debug(DEBUG_UNEXPECTED, "doHanGHUM(): only the 'current' request is supported");
+		return;
+	}
+
+		
+	debug(DEBUG_ACTION, "doHanGHUM()");	
+
+	qHanGHUM(sp, FALSE);
+}
+
+/*
+ * Queue a HAN GWSP command
+ */
+
+static void qHanGWSP(serviceEntryPtr_t sp, Bool isPoll)
+{
+	String cmd;
+	
+	if(!sp)
+		return;
+		
+	/* Allocate buffer for command */
+	if(!(cmd = mallocz(WS_SIZE)))
+		MALLOC_ERROR;
+	
+			
+	/* Format command */
+	snprintf(cmd, WS_SIZE, "CA%02X%02X%02x0000000000",sp->address, (unsigned ) sp->cmd, sp->channel);
+
+	queueCommand(cmd, sp, isPoll);
+}
+
+
+/*
+ * Do HAN wind speed command
+ */
+ 
+
+
+static void doHanGWSP(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
+{
+	const String request =  xPL_getMessageNamedValue(theMessage, "request");
+	const String device =  xPL_getMessageNamedValue(theMessage, "device");
+
+	
+	if(!request){
+		debug(DEBUG_UNEXPECTED, "doHanGWSP(): no request specified");
+		return;
+	}
+		
+	if(!device){
+		debug(DEBUG_UNEXPECTED, "doHanGWSP(): no device specified, device is required");
+
+	}
+	else{
+		unsigned dev;
+		if(!str2uns(device, &dev, 0, 0)){
+			debug(DEBUG_UNEXPECTED, "doHanGWSP(): device=0 is required");
+			return;
+		}
+	}
+	
+	if(strcmp(request, "current")){ 
+		debug(DEBUG_UNEXPECTED, "doHanGWSP(): only the 'current' request is supported");
+		return;
+	}
+
+		
+	debug(DEBUG_ACTION, "doHanGWSP()");	
+
+	qHanGWSP(sp, FALSE);
+}
+
+
+/*
+ * Queue a HAN Wind direction command
+ */
+
+static void qHanGWDR(serviceEntryPtr_t sp, Bool isPoll)
+{
+	String cmd;
+	
+	if(!sp)
+		return;
+		
+	/* Allocate buffer for command */
+	if(!(cmd = mallocz(WS_SIZE)))
+		MALLOC_ERROR;
+	
+			
+	/* Format command */
+	snprintf(cmd, WS_SIZE, "CA%02X%02X000000",sp->address, (unsigned ) sp->cmd);
+
+	queueCommand(cmd, sp, isPoll);
+}
+
+
+/*
+ * Do HAN wind direction command 
+ */
+ 
+
+
+static void doHanGWDR(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
+{
+	const String request =  xPL_getMessageNamedValue(theMessage, "request");
+	const String device =  xPL_getMessageNamedValue(theMessage, "device");
+
+	
+	if(!request){
+		debug(DEBUG_UNEXPECTED, "doHanGWDR(): no request specified");
+		return;
+	}
+		
+	if(!device){
+		debug(DEBUG_UNEXPECTED, "doHanGWDR(): no device specified, device is required");
+
+	}
+	else{
+		unsigned dev;
+		if(!str2uns(device, &dev, 0, 0)){
+			debug(DEBUG_UNEXPECTED, "doHanGWDR(): device=0 is required");
+			return;
+		}
+	}
+	
+	if(strcmp(request, "current")){ 
+		debug(DEBUG_UNEXPECTED, "doHanGWDR(): only the 'current' request is supported");
+		return;
+	}
+
+		
+	debug(DEBUG_ACTION, "doHanGWDR()");	
+
+	qHanGWDR(sp, FALSE);
+}
+
+
+/*
+ * Queue a HAN rain gauge command
+ */
+
+static void qHanGRGC(serviceEntryPtr_t sp, Bool isPoll)
+{
+	String cmd;
+	
+	if(!sp)
+		return;
+		
+	/* Allocate buffer for command */
+	if(!(cmd = mallocz(WS_SIZE)))
+		MALLOC_ERROR;
+	
+			
+	/* Format command */
+	snprintf(cmd, WS_SIZE, "CA%02X%02X00000000%02X00000000",sp->address, (unsigned ) sp->cmd, sp->channel);
+
+	queueCommand(cmd, sp, isPoll);
+}
+
+
+/*
+ * Do rain gauge command
+ */
+ 
+
+
+static void doHanGRGC(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
+{
+	const String request =  xPL_getMessageNamedValue(theMessage, "request");
+	const String device =  xPL_getMessageNamedValue(theMessage, "device");
+
+	
+	if(!request){
+		debug(DEBUG_UNEXPECTED, "doHanGRGC(): no request specified");
+		return;
+	}
+		
+	if(!device){
+		debug(DEBUG_UNEXPECTED, "doHanGRGC(): no device specified, device is required");
+
+	}
+	else{
+		unsigned dev;
+		if(!str2uns(device, &dev, 0, 0)){
+			debug(DEBUG_UNEXPECTED, "doHanGRGC(): device=0 is required");
+			return;
+		}
+	}
+	
+	if(strcmp(request, "current")){ 
+		debug(DEBUG_UNEXPECTED, "doHanGRGC(): only the 'current' request is supported");
+		return;
+	}
+
+		
+	debug(DEBUG_ACTION, "doHanGRGC()");	
+
+	qHanGRGC(sp, FALSE);
+}
+
+
+/*
  * Poll dispatcher
  */ 
 
@@ -1282,6 +1854,23 @@ static void dispatchPollCommand(serviceEntryPtr_t sp)
 		case GCUR:
 			qHanGCUR(sp, TRUE);
 			break;
+			
+		case GHUM:
+			qHanGHUM(sp, TRUE);
+			break;
+			
+		case GWSP:
+			qHanGWSP(sp, TRUE);
+			break;
+			
+		case GWDR:
+			qHanGWDR(sp, TRUE);
+			break;
+		
+	    case GRGC:
+			qHanGRGC(sp, TRUE);
+			break;
+		
 		
 		default:
 			debug(DEBUG_UNEXPECTED, "Got unrecognized poll request %u", (unsigned) sp->cmd);
@@ -1323,6 +1912,22 @@ static void dispatchHanCommand(xPL_MessagePtr theMessage, serviceEntryPtr_t sp)
 			doHanGCUR(theMessage, sp);
 			break;
 			
+	    case GHUM:
+			doHanGHUM(theMessage, sp);
+			break;
+			
+		case GWSP:
+			doHanGWSP(theMessage, sp);
+			break;
+			
+		case GWDR:
+			doHanGWDR(theMessage, sp);
+			break;
+			
+		case GRGC:
+			doHanGRGC(theMessage, sp);
+			break;
+					
 		default:
 			debug(DEBUG_UNEXPECTED,"Invalid han command received: %02X", (unsigned) sp->cmd);
 			break; 
@@ -1675,9 +2280,10 @@ int main(int argc, char *argv[])
 				if(!strcmp(p, unitsMap[j].keyword))
 					break;
 			}
+	
 		}
-		if(!(sp->units = unitsMap[j].code))
-			fatal("Unrecognized units: %s in stanza: %s", p, slist[i]);	
+		if(!(sp->units = unitsMap[j].code)) //??????????
+				fatal("Unrecognized units: %s in stanza: %s", p, slist[i]);		
 			
 		/* Check poll-interval if present and class is sensor */
 		
